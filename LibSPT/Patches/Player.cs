@@ -1,4 +1,5 @@
 ﻿using System.Reflection;
+using Comfort.Common;
 using EFT;
 using HarmonyLib;
 using SPT.Reflection.Patching;
@@ -49,20 +50,7 @@ public class PlayerConstructorPostfixPatch : ModulePatch
     }
 }
 
-public class SlotViewChangedPostfixPatch : ModulePatch
-{
-    protected override MethodBase GetTargetMethod()
-    {
-        return typeof(PlayerBody.EquipmentSlotClass).GetMethod(nameof(PlayerBody.EquipmentSlotClass.method_4));
-    }
-
-    [PatchPostfix]
-    // ReSharper disable once InconsistentNaming
-    public static void Postfix(PlayerBody.EquipmentSlotClass __instance)
-    {
-        for (var i = 0; i < __instance.Renderers.Length; i++)
-        {
-            __instance.Renderers[i].enabled = true;
-        }
-    }
-}
+// The old SlotViewChangedPostfixPatch (which patched EquipmentSlotClass.method_4 to force-enable renderers)
+// has been replaced by ThirdPersonView.SyncHolsteredEquipmentVisibility, called each frame from UpdateCamera.
+// A one-shot postfix on model creation races with the draw/holster model rebuild and leaves the primary
+// visible on your back while it's in your hands; see the comment on that method for the full ordering.

@@ -1,7 +1,9 @@
 ﻿using System;
 using Comfort.Common;
 using EFT;
+using EFT.Ballistics;
 using EFT.CameraControl;
+using EFT.Settings;
 using HarmonyLib;
 using HollywoodCam.Collision;
 using HollywoodCam.Helpers;
@@ -49,7 +51,7 @@ public class ThirdPersonView : MonoBehaviour
     private Player.ItemHandsController _handsController;
     private Player.FirearmController _firearmController;
 
-    private SharedGameSettingsClass _gameSettings;
+    private SettingsManager _gameSettings;
 
     public void Awake()
     {
@@ -64,9 +66,9 @@ public class ThirdPersonView : MonoBehaviour
         Plugin.AdsModeBasic.SettingChanged += (_, _) => _adsModeBasic = Plugin.AdsModeBasic.Value;
 
         // Hit mask for the camera root. Remove players from this to avoid colliding with ourselves, duh
-        _eyeCameraHitMask = LayerMasksDataAbstractClass.HitMask.value & ~(1 << LayerMask.NameToLayer("HitCollider"));
+        _eyeCameraHitMask = BallisticsCalculatorConstants.HitMask.value & ~(1 << LayerMask.NameToLayer("HitCollider"));
 
-        _gameSettings = Singleton<SharedGameSettingsClass>.Instance;
+        _gameSettings = Singleton<SettingsManager>.Instance;
 
         _positionSolver = new PositionSolver(
             new AdvectionSolver(
@@ -300,7 +302,7 @@ public class ThirdPersonView : MonoBehaviour
 
             // Force our own custom weapon animation strategy that enables proper recoil
             localPlayer.ProceduralWeaponAnimation.SetStrategy(StaticData.CustomAnimStrategy);
-            CameraClass.Instance.Camera.nearClipPlane = 0.005f;
+            CameraManager.Instance.Camera.nearClipPlane = 0.005f;
 
             // Re-enable recoil and hit reactions in third person
             if (localPlayer.HitReaction != null)
@@ -319,12 +321,12 @@ public class ThirdPersonView : MonoBehaviour
             {
                 localPlayer.ProceduralWeaponAnimation.SetStrategy(
                     localPlayer.ProceduralWeaponAnimation.IsMountedState
-                        ? localPlayer.MovementContext.MountingStrategy
+                        ? localPlayer.MovementContext._mountingStrategy
                         : StaticData.FpAnimStrategy
                 );
             }
 
-            CameraClass.Instance.Camera.nearClipPlane = 0.03f;
+            CameraManager.Instance.Camera.nearClipPlane = 0.03f;
         }
 
         if (_firearmController != null)
@@ -340,17 +342,17 @@ public class ThirdPersonView : MonoBehaviour
 
     private void AdjustFoV(int adjustment, float time)
     {
-        CameraClass.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value + adjustment, time);
+        CameraManager.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value + adjustment, time);
     }
 
     private static void SetFoV(int fov)
     {
-        CameraClass.Instance.SetFov(fov, Plugin.AdsFovChangeTime.Value);
+        CameraManager.Instance.SetFov(fov, Plugin.AdsFovChangeTime.Value);
     }
 
     private void ResetFoV()
     {
-        CameraClass.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value, Plugin.AdsFovChangeTime.Value);
+        CameraManager.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value, Plugin.AdsFovChangeTime.Value);
     }
 
     public void OnGUI()
@@ -387,12 +389,11 @@ public class ThirdPersonView : MonoBehaviour
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Environs: {localPlayer.Environment} roof: {localPlayer.IsUnderRoof}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"HandCtr: {_handsController}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"FACtr: {_firearmController}", centered: false);
-            var cameraController = localPlayer.gameObject.GetComponent<PlayerCameraController>();
-            if (cameraController != null)
-            {
-                var pcaStrategy = Traverse.Create(cameraController).Field("gclass3688_0").GetValue<GClass3688>();
-                rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"PCA Strat: {pcaStrategy}", centered: false);
-            }
+            // SPT 4.1: PlayerCameraController no longer has a "gclass3688_0" strategy field, and the
+            // GClass3688 type is gone with no equivalent. This was a debug-overlay label only, so it now
+            // reports the animation strategy off ProceduralWeaponAnimation instead.
+            var pcaStrategy = Traverse.Create(localPlayer.ProceduralWeaponAnimation).Field("_strategy").GetValue<IProceduralAnimationStrategy>();
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"PCA Strat: {pcaStrategy}", centered: false);
 
             if (_firearmController != null)
             {
@@ -400,7 +401,7 @@ public class ThirdPersonView : MonoBehaviour
                 rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Current Scope: {pwa.CurrentScope}", centered: false);
             }
 
-            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Near Clip Plane: {CameraClass.Instance.Camera.nearClipPlane}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Near Clip Plane: {CameraManager.Instance.Camera.nearClipPlane}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Line Scan Radius P1: {_positionSolver.Phase1.LineScanRadius} P2: {_positionSolver.Phase2.LineScanRadius} P3: {_positionSolver.Phase3.LineScanRadius}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Player Velocity: {localPlayer.Velocity} Motion: {localPlayer.Motion} Rot: {localPlayer.MovementContext.Rotation}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Offset: {_currentOffset} PWA Offset: {pwa.HandsContainer.CameraOffset}", centered: false);
@@ -434,7 +435,7 @@ public class ThirdPersonView : MonoBehaviour
             targetPoint = _firearmController.CurrentFireport.position + 10000f * _firearmController.WeaponDirection;
         }
 
-        var screenPosition = CameraClass.Instance.Camera.WorldPointToVisibleScreenPoint(targetPoint);
+        var screenPosition = CameraManager.Instance.Camera.WorldPointToVisibleScreenPoint(targetPoint);
 
         if (screenPosition == Vector2.zero)
             return;

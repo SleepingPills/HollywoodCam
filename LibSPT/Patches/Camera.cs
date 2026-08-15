@@ -96,19 +96,19 @@ public class ProceduralWeaponAnimationSetStrategyPrefixPatch : ModulePatch
 {
     protected override MethodBase GetTargetMethod()
     {
-        return typeof(ProceduralWeaponAnimation).GetMethod(nameof(ProceduralWeaponAnimation.SetStrategy), types: [typeof(GInterface38)]);
+        return typeof(ProceduralWeaponAnimation).GetMethod(nameof(ProceduralWeaponAnimation.SetStrategy), types: [typeof(IProceduralAnimationStrategy)]);
     }
 
     [PatchPrefix]
     [SuppressMessage("ReSharper", "InconsistentNaming")]
-    public static void Prefix(ProceduralWeaponAnimation __instance, ref GInterface38 strategy)
+    public static void Prefix(ProceduralWeaponAnimation __instance, ref IProceduralAnimationStrategy strategy)
     {
         var localPlayer = Singleton<GameWorld>.Instance.MainPlayer;
 
         if (localPlayer == null || __instance != localPlayer.ProceduralWeaponAnimation)
             return;
 
-        if (strategy is GClass908)
+        if (strategy is ThirdPersonStrategy)
         {
             // Hijack any attempt at using the shonky builtin 3rd person strategy
             strategy = StaticData.CustomAnimStrategy;

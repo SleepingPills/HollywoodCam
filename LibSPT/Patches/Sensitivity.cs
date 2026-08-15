@@ -1,6 +1,7 @@
 ﻿using System.Reflection;
 using Comfort.Common;
 using EFT;
+using EFT.Settings;
 using SPT.Reflection.Patching;
 
 namespace HollywoodCam.Patches;
@@ -23,7 +24,7 @@ public class FirearmControllerUpdateSensitivityPrefixPatchPatch : ModulePatch
 
         if (localPlayer.PointOfView != EPointOfView.ThirdPerson || !__instance.IsAiming) return true;
 
-        ____aimingSens = Singleton<SharedGameSettingsClass>.Instance.Control.Settings.MouseAimingSensitivity * Plugin.AdsThirdPersonSensitivity.Value;
+        ____aimingSens = Singleton<SettingsManager>.Instance.Control.Settings.MouseAimingSensitivity * Plugin.AdsThirdPersonSensitivity.Value;
         return false;
     }
 }
