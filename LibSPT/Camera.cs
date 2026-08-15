@@ -104,6 +104,53 @@ public class ThirdPersonView : MonoBehaviour
             _cameraStance = 1;
     }
 
+    /// <summary>
+    ///     Keeps holstered/back equipment visible in 3rd person, EXCEPT the item currently in hands.
+    ///
+    ///     BSG's SlotView.CreateAndParent disables every renderer when _isYourPlayer (you never see your own
+    ///     back in 1st person), so showing that gear requires re-enabling them. Doing it once in a
+    ///     CreateAndParent postfix isn't enough: drawing a weapon runs
+    ///     ItemHandsController.CreateItemHandsController -> DestroyCurrentModel, and the slot view then
+    ///     recreates the model asynchronously. That recreate can land before HandsController.Item is set,
+    ///     so a one-shot check at creation time sees no item in hands and re-enables the back model --
+    ///     leaving the primary drawn on your back while it's also in your hands.
+    ///
+    ///     Re-evaluating every frame is self-correcting regardless of that ordering, and is only a handful
+    ///     of slot views per frame.
+    /// </summary>
+    private void SyncHolsteredEquipmentVisibility()
+    {
+        var body = localPlayer.PlayerBody;
+        if (body?.SlotViews == null)
+            return;
+
+        var itemInHands = localPlayer.HandsController?.Item;
+
+        // NB: compare against the REAL inventory slot, not slotView.ContainedItem.
+        // slotView.ContainedItem is _slot.ReactiveContainedItem, and other mods can hand PlayerBody a cloned
+        // equipment -- Transmog does exactly this (CloneVisibleItem in its PlayerBody.Init patch) -- so the
+        // body's slot items are clones with different instance ids and never reference-match the hands item.
+        // The real equipment is untouched, so resolving the slot there is clone-proof.
+        var equipment = localPlayer.InventoryController?.Inventory?.Equipment;
+
+        // DictionaryListHydra exposes Count/GetByIndex rather than a Values collection.
+        for (var s = 0; s < body.SlotViews.Count; s++)
+        {
+            var slotView = body.SlotViews.GetByIndex(s);
+            var renderers = slotView?.Renderers;
+            if (renderers == null)
+                continue;
+
+            var realItemInSlot = equipment?.GetSlot(slotView.EquipmentSlot)?.ContainedItem;
+            var shouldShow = itemInHands == null || realItemInSlot == null || realItemInSlot != itemInHands;
+            for (var i = 0; i < renderers.Length; i++)
+            {
+                if (renderers[i] != null && renderers[i].enabled != shouldShow)
+                    renderers[i].enabled = shouldShow;
+            }
+        }
+    }
+
     public void UpdateCamera()
     {
         // NB: Has to be LateUpdate as doing all this in Update can cause the camera to occasionally clip into the wall when mousing violently.
@@ -114,6 +161,8 @@ public class ThirdPersonView : MonoBehaviour
 
         _handsController = localPlayer.HandsController as Player.ItemHandsController;
         _firearmController = localPlayer.HandsController as Player.FirearmController;
+
+        SyncHolsteredEquipmentVisibility();
 
         var isAiming = _handsController != null && _handsController.IsAiming;
 
