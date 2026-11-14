@@ -1,7 +1,9 @@
 ﻿using System;
 using Comfort.Common;
 using EFT;
+using EFT.Ballistics;
 using EFT.CameraControl;
+using EFT.Settings;
 using HarmonyLib;
 using HollywoodCam.Collision;
 using HollywoodCam.Helpers;
@@ -49,7 +51,7 @@ public class ThirdPersonView : MonoBehaviour
     private Player.ItemHandsController _handsController;
     private Player.FirearmController _firearmController;
 
-    private SharedGameSettingsClass _gameSettings;
+    private SettingsManager _gameSettings;
 
     public void Awake()
     {
@@ -64,9 +66,9 @@ public class ThirdPersonView : MonoBehaviour
         Plugin.AdsModeBasic.SettingChanged += (_, _) => _adsModeBasic = Plugin.AdsModeBasic.Value;
 
         // Hit mask for the camera root. Remove players from this to avoid colliding with ourselves, duh
-        _eyeCameraHitMask = LayerMasksDataAbstractClass.HitMask.value & ~(1 << LayerMask.NameToLayer("HitCollider"));
+        _eyeCameraHitMask = BallisticsCalculatorConstants.HitMask.value & ~(1 << LayerMask.NameToLayer("HitCollider"));
 
-        _gameSettings = Singleton<SharedGameSettingsClass>.Instance;
+        _gameSettings = Singleton<SettingsManager>.Instance;
 
         _positionSolver = new PositionSolver(
             new AdvectionSolver(
@@ -102,6 +104,53 @@ public class ThirdPersonView : MonoBehaviour
             _cameraStance = 1;
     }
 
+    /// <summary>
+    ///     Keeps holstered/back equipment visible in 3rd person, EXCEPT the item currently in hands.
+    ///
+    ///     BSG's SlotView.CreateAndParent disables every renderer when _isYourPlayer (you never see your own
+    ///     back in 1st person), so showing that gear requires re-enabling them. Doing it once in a
+    ///     CreateAndParent postfix isn't enough: drawing a weapon runs
+    ///     ItemHandsController.CreateItemHandsController -> DestroyCurrentModel, and the slot view then
+    ///     recreates the model asynchronously. That recreate can land before HandsController.Item is set,
+    ///     so a one-shot check at creation time sees no item in hands and re-enables the back model --
+    ///     leaving the primary drawn on your back while it's also in your hands.
+    ///
+    ///     Re-evaluating every frame is self-correcting regardless of that ordering, and is only a handful
+    ///     of slot views per frame.
+    /// </summary>
+    private void SyncHolsteredEquipmentVisibility()
+    {
+        var body = localPlayer.PlayerBody;
+        if (body?.SlotViews == null)
+            return;
+
+        var itemInHands = localPlayer.HandsController?.Item;
+
+        // NB: compare against the REAL inventory slot, not slotView.ContainedItem.
+        // slotView.ContainedItem is _slot.ReactiveContainedItem, and other mods can hand PlayerBody a cloned
+        // equipment -- Transmog does exactly this (CloneVisibleItem in its PlayerBody.Init patch) -- so the
+        // body's slot items are clones with different instance ids and never reference-match the hands item.
+        // The real equipment is untouched, so resolving the slot there is clone-proof.
+        var equipment = localPlayer.InventoryController?.Inventory?.Equipment;
+
+        // DictionaryListHydra exposes Count/GetByIndex rather than a Values collection.
+        for (var s = 0; s < body.SlotViews.Count; s++)
+        {
+            var slotView = body.SlotViews.GetByIndex(s);
+            var renderers = slotView?.Renderers;
+            if (renderers == null)
+                continue;
+
+            var realItemInSlot = equipment?.GetSlot(slotView.EquipmentSlot)?.ContainedItem;
+            var shouldShow = itemInHands == null || realItemInSlot == null || realItemInSlot != itemInHands;
+            for (var i = 0; i < renderers.Length; i++)
+            {
+                if (renderers[i] != null && renderers[i].enabled != shouldShow)
+                    renderers[i].enabled = shouldShow;
+            }
+        }
+    }
+
     public void UpdateCamera()
     {
         // NB: Has to be LateUpdate as doing all this in Update can cause the camera to occasionally clip into the wall when mousing violently.
@@ -112,6 +161,8 @@ public class ThirdPersonView : MonoBehaviour
 
         _handsController = localPlayer.HandsController as Player.ItemHandsController;
         _firearmController = localPlayer.HandsController as Player.FirearmController;
+
+        SyncHolsteredEquipmentVisibility();
 
         var isAiming = _handsController != null && _handsController.IsAiming;
 
@@ -300,7 +351,7 @@ public class ThirdPersonView : MonoBehaviour
 
             // Force our own custom weapon animation strategy that enables proper recoil
             localPlayer.ProceduralWeaponAnimation.SetStrategy(StaticData.CustomAnimStrategy);
-            CameraClass.Instance.Camera.nearClipPlane = 0.005f;
+            CameraManager.Instance.Camera.nearClipPlane = 0.005f;
 
             // Re-enable recoil and hit reactions in third person
             if (localPlayer.HitReaction != null)
@@ -319,12 +370,12 @@ public class ThirdPersonView : MonoBehaviour
             {
                 localPlayer.ProceduralWeaponAnimation.SetStrategy(
                     localPlayer.ProceduralWeaponAnimation.IsMountedState
-                        ? localPlayer.MovementContext.MountingStrategy
+                        ? localPlayer.MovementContext._mountingStrategy
                         : StaticData.FpAnimStrategy
                 );
             }
 
-            CameraClass.Instance.Camera.nearClipPlane = 0.03f;
+            CameraManager.Instance.Camera.nearClipPlane = 0.03f;
         }
 
         if (_firearmController != null)
@@ -340,17 +391,17 @@ public class ThirdPersonView : MonoBehaviour
 
     private void AdjustFoV(int adjustment, float time)
     {
-        CameraClass.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value + adjustment, time);
+        CameraManager.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value + adjustment, time);
     }
 
     private static void SetFoV(int fov)
     {
-        CameraClass.Instance.SetFov(fov, Plugin.AdsFovChangeTime.Value);
+        CameraManager.Instance.SetFov(fov, Plugin.AdsFovChangeTime.Value);
     }
 
     private void ResetFoV()
     {
-        CameraClass.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value, Plugin.AdsFovChangeTime.Value);
+        CameraManager.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value, Plugin.AdsFovChangeTime.Value);
     }
 
     public void OnGUI()
@@ -387,12 +438,11 @@ public class ThirdPersonView : MonoBehaviour
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Environs: {localPlayer.Environment} roof: {localPlayer.IsUnderRoof}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"HandCtr: {_handsController}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"FACtr: {_firearmController}", centered: false);
-            var cameraController = localPlayer.gameObject.GetComponent<PlayerCameraController>();
-            if (cameraController != null)
-            {
-                var pcaStrategy = Traverse.Create(cameraController).Field("gclass3688_0").GetValue<GClass3688>();
-                rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"PCA Strat: {pcaStrategy}", centered: false);
-            }
+            // SPT 4.1: PlayerCameraController no longer has a "gclass3688_0" strategy field, and the
+            // GClass3688 type is gone with no equivalent. This was a debug-overlay label only, so it now
+            // reports the animation strategy off ProceduralWeaponAnimation instead.
+            var pcaStrategy = Traverse.Create(localPlayer.ProceduralWeaponAnimation).Field("_strategy").GetValue<IProceduralAnimationStrategy>();
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"PCA Strat: {pcaStrategy}", centered: false);
 
             if (_firearmController != null)
             {
@@ -400,7 +450,7 @@ public class ThirdPersonView : MonoBehaviour
                 rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Current Scope: {pwa.CurrentScope}", centered: false);
             }
 
-            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Near Clip Plane: {CameraClass.Instance.Camera.nearClipPlane}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Near Clip Plane: {CameraManager.Instance.Camera.nearClipPlane}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Line Scan Radius P1: {_positionSolver.Phase1.LineScanRadius} P2: {_positionSolver.Phase2.LineScanRadius} P3: {_positionSolver.Phase3.LineScanRadius}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Player Velocity: {localPlayer.Velocity} Motion: {localPlayer.Motion} Rot: {localPlayer.MovementContext.Rotation}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Offset: {_currentOffset} PWA Offset: {pwa.HandsContainer.CameraOffset}", centered: false);
@@ -434,7 +484,7 @@ public class ThirdPersonView : MonoBehaviour
             targetPoint = _firearmController.CurrentFireport.position + 10000f * _firearmController.WeaponDirection;
         }
 
-        var screenPosition = CameraClass.Instance.Camera.WorldPointToVisibleScreenPoint(targetPoint);
+        var screenPosition = CameraManager.Instance.Camera.WorldPointToVisibleScreenPoint(targetPoint);
 
         if (screenPosition == Vector2.zero)
             return;

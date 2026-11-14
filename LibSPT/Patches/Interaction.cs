@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using EFT;
+using EFT.CameraControl;
 using SPT.Reflection.Patching;
 using UnityEngine;
 
@@ -22,7 +23,7 @@ public class GameWorldFindInteractablePrefixPatch : ModulePatch
             EFTHardSettings.Instance.PLAYER_RAYCAST_DISTANCE + EFTHardSettings.Instance.BEHIND_CAST
         );
         var gameObject =
-            EFTPhysicsClass.SphereCast(ray, Plugin.InteractionRayRadius.Value, out hit, maxDistance, GameWorld.InteractiveLootMaskWPlayer)
+            PhysicsExtensions.SphereCast(ray, Plugin.InteractionRayRadius.Value, out hit, maxDistance, GameWorld.InteractiveLootMaskWPlayer)
                 ? hit.collider.gameObject
                 : null;
         __result = gameObject != null && !Physics.Linecast(ray.origin, hit.point, GameWorld.LootMaskObstruction) ? gameObject : null;
@@ -43,13 +44,13 @@ public class PlayerInteractionRayPrefixPatch : ModulePatch
     public static bool Prefix(Player __instance, ref Ray __result)
     {
         if (!__instance.IsYourPlayer
-            || CameraClass.Instance == null
-            || CameraClass.Instance.Camera == null
+            || CameraManager.Instance == null
+            || CameraManager.Instance.Camera == null
             || __instance.PlayerBody is null
             || __instance.PlayerBody.PointOfView != EPointOfView.ThirdPerson)
             return true;
 
-        var cameraTransform = CameraClass.Instance.Camera.transform;
+        var cameraTransform = CameraManager.Instance.Camera.transform;
         __result = new Ray(cameraTransform.position, cameraTransform.forward);
         return false;
     }

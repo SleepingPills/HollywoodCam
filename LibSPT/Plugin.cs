@@ -114,7 +114,7 @@ public class Plugin : BaseUnityPlugin
         // Player
         new PlayerConstructorPostfixPatch().Enable();
         new PlayerShotReactionsPostfixPatch().Enable();
-        new SlotViewChangedPostfixPatch().Enable();
+        // SlotViewChangedPostfixPatch removed: replaced by per-frame SyncHolsteredEquipmentVisibility (see Camera.cs)
 
         // Lean
         new PlayerOnLeanPostfixPatch().Enable();

@@ -10,9 +10,9 @@ namespace HollywoodCam;
 ///     1. Skip AvoidObstacles to reduce the jank slightly and prevent the gun from being pushed away by walls.
 ///     2. Patch PWA.LerpCamera so that it doesn't molest the position, only the rotation. This retains headbob, lean tilt and recoil.
 /// </summary>
-public class CustomAnimStrategy : GInterface38
+public class CustomAnimStrategy : IProceduralAnimationStrategy
 {
-    private readonly GClass909 _wrapped = new();
+    private readonly FirstPersonStrategy _wrapped = new();
 
     public void ProcessEffectors(ProceduralWeaponAnimation pwa, float deltaTime, int nFixedFrames = 1)
     {
@@ -33,7 +33,17 @@ public class CustomAnimStrategy : GInterface38
 
     public void ApplyCameraTransformations(ProceduralWeaponAnimation pwa, float dt)
     {
-        _wrapped.ApplyCameraTransformations(pwa, dt);
+        // Deliberately a no-op, matching BSG's ThirdPersonStrategy (whose ApplyCameraTransformations is empty).
+        //
+        // This strategy only ever runs in 3rd person, where HollywoodCam drives the camera itself via
+        // ThirdPersonView.UpdateCamera. Delegating to FirstPersonStrategy here would run
+        // CalculateCameraPosition + LerpCamera and move the real camera, fighting the mod's own camera --
+        // which shows up as violent shaking during reloads, when tactical-reload transforms are largest.
+        //
+        // NB: in 1.2.0 this method never actually ran. The strategy hijack tested `strategy is GClass908`,
+        // which the 4.0->4.1 mapping shows was BetterValProcessor (an ordinary object, not a strategy), so
+        // the check could never be true. Correcting it to ThirdPersonStrategy activated this path for the
+        // first time and exposed the conflict.
     }
 
     public void LateTransformations(ProceduralWeaponAnimation pwa, float dt)
