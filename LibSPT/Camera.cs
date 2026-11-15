@@ -106,13 +106,46 @@ public class ThirdPersonView : MonoBehaviour
     // Body yaw as of the last time it could be read, for a body pitched vertical
     private Quaternion _lastBodyYaw = Quaternion.identity;
 
+    // The pivot's lag behind the character's travel (see PivotTrail), stepped with the pivot filter
+    private readonly PivotTrail _pivotTrail = new();
+    // The follow settings as applied: eased toward the settings, and toward zero while aiming down sights, so neither a
+    // settings change nor ADS jumps the camera: a shrinking smoothing time closes the lag progressively faster, so by the
+    // frame it reaches zero (a hard deadzone edge) the lag is already within a centimetre or so of the deadzone.
+    private float _followDeadzone;
+    private float _followSmoothing;
+    private const float FollowDeadzoneRate = 0.5f;
+    private const float FollowSmoothingRate = 1f;
+
     // Upper body aim deadzone, applied through Player.TrunkRotationLimit (see TorsoDeadzone)
     private readonly TorsoDeadzone _torsoDeadzone = new();
     // Whether the limit was last left to the game because the player is prone or getting in or out of it
     private bool _torsoProneHold;
 
+    // Moving deadzone: the walking state's legs, driven from the MovePlayerState.UpdateRotation patch (see MovingDeadzone)
+    private readonly MovingDeadzone _movingDeadzone = new();
+    // Whether the moving deadzone had the walking legs as of the last LateUpdate, for the standing hand-off and debug UI
+    private bool _movingDeadzoneInControl;
+    // The game's own "not getting anywhere" speed for walking (MovePlayerState.velocityThreshold, its wall lock), so a
+    // walk the game would lock against a wall reads as blocked too, and no real walk does
+    private const float WalkBlockedSpeed = 0.2f;
+    // Longer than the game's 0.1s wall lock wait and than a walk takes to get going, so starting to walk eases
+    private const float WalkBlockedGraceTime = 0.3f;
+    private const float WalkInputMinSqr = 0.01f;
+    // Below this the travel direction is mostly noise and inertia, the debug readout does not show it
+    private const float TravelErrorMinSpeed = 0.3f;
+    private bool _walkBlocked;
+    private float _walkBlockedTime;
+    // Measured from the player's position each LateUpdate, not taken from the controller, so it is what really happened
+    private Vector3 _horizontalVelocity;
+    private Vector3 _lastPlayerPosition;
+    private bool _hasLastPlayerPosition;
+    // The walking state's raw, body-local input as of the last LateUpdate (zero when not walking)
+    private Vector2 _walkInput;
+
     // Procedural weight on the walk and sprint cycle (see GaitPoser), applied from the Player.FBBIKUpdate postfix
     private GaitPoser _gaitPoser;
+    // Cosmetic recoil push of the upper body per shot (see ShoulderRecoilPoser), applied from the Player.IkProcess prefix
+    private ShoulderRecoilPoser _shoulderRecoilPoser;
 
     private EventHandler _adsModeOpticChanged;
     private EventHandler _adsModeBasicChanged;
@@ -160,11 +193,14 @@ public class ThirdPersonView : MonoBehaviour
         _rig = new CameraRig();
 
         _bodyBobWeight = Mathf.Clamp01(Plugin.BodyBob.Value);
+        _followDeadzone = Mathf.Max(0f, Plugin.CameraFollowDeadzone.Value);
+        _followSmoothing = Mathf.Max(0f, Plugin.CameraFollowSmoothing.Value);
 
         // What bullets can hit, other characters' hit colliders included, so aiming at someone converges on them
         _aimSolver = new AimSolver(BallisticsCalculatorConstants.HitMask.value);
 
         _gaitPoser = new GaitPoser(Plugin.GaitWeight.Value);
+        _shoulderRecoilPoser = new ShoulderRecoilPoser(Plugin.ShoulderRecoil.Value);
     }
 
     public void OnDestroy()
@@ -172,7 +208,9 @@ public class ThirdPersonView : MonoBehaviour
         Plugin.AdsModeOptic.SettingChanged -= _adsModeOpticChanged;
         Plugin.AdsModeBasic.SettingChanged -= _adsModeBasicChanged;
 
-        // Before the game's OnDead/Dispose (both destroy this immediately), so the body goes to ragdoll unmodified
+        // Before the game's OnDead/Dispose (both destroy this immediately), so the body goes to ragdoll unmodified.
+        // Shoulder recoil first: it wrote the shared neck last, so it is put back first.
+        _shoulderRecoilPoser?.Dispose();
         _gaitPoser?.Dispose();
 
         _rig?.Destroy();
@@ -185,6 +223,9 @@ public class ThirdPersonView : MonoBehaviour
     /// </summary>
     public void Update()
     {
+        // Reverse of the order they write in: both touch the neck, and the shoulder recoil caches it after the gait has
+        // moved it, so the gait's cache is the clean one and has to be applied last
+        _shoulderRecoilPoser?.Restore();
         _gaitPoser?.Restore();
     }
 
@@ -194,6 +235,9 @@ public class ThirdPersonView : MonoBehaviour
     /// </summary>
     public void OnBodyIkSolved()
     {
+        // Backstop for a missed Update, ahead of the gait's own: see Update for the order
+        _shoulderRecoilPoser?.Restore();
+
         if (localPlayer == null || _gaitPoser == null)
             return;
 
@@ -263,6 +307,70 @@ public class ThirdPersonView : MonoBehaviour
             default:
                 return false;
         }
+    }
+
+    /// <summary>
+    ///     From the Player.IkProcess prefix, once per frame on VisualPass's full path: the weapon is placed and the upper
+    ///     arms pinned, the arm IK is next. rightHandWeight is the game's right arm IK weight; markers its hand IK markers.
+    /// </summary>
+    public void OnArmIkStarting(float rightHandWeight, Transform[] markers)
+    {
+        if (localPlayer == null || _shoulderRecoilPoser == null)
+            return;
+
+        var movementContext = localPlayer.MovementContext;
+        if (movementContext == null)
+            return;
+
+        // The same hard stops as the gait (see OnBodyIkSolved), plus the game posing the body: mounted the game does not
+        // even pin the shoulders, and a stationary weapon or vehicle has no shot to take
+        if (!IsViewThirdPerson)
+        {
+            _shoulderRecoilPoser.Hold("1st person");
+            return;
+        }
+
+        if (localPlayer.BodyUpdateMode != Player.EUpdateMode.Auto || localPlayer.UpdateQueue != EUpdateQueue.Update)
+        {
+            _shoulderRecoilPoser.Hold("Animator timing");
+            return;
+        }
+
+        if (localPlayer.CustomAnimationsAreProcessing || localPlayer.UsedSimplifiedSkeleton)
+        {
+            _shoulderRecoilPoser.Hold("Custom animation");
+            return;
+        }
+
+        if (IsBodyPosedByGame)
+        {
+            _shoulderRecoilPoser.Hold("Posed by game");
+            return;
+        }
+
+        string fadeReason = null;
+        if (IsGaitBlockedState(movementContext))
+            fadeReason = "Vault/climb";
+        else if (movementContext.PlayerAnimator != null && movementContext.PlayerAnimator.AnimatedInteractions is { IsInteractionPlaying: true })
+            fadeReason = "Interaction";
+        else if (localPlayer.HandsController is not Player.FirearmController)
+            fadeReason = "No firearm";
+
+        // Lying on the chest there is little to twist; crouched a little less than standing
+        var scale = IsProneOrTransitioning(movementContext)
+            ? ShoulderRecoilPoser.ProneScale
+            : Mathf.Lerp(ShoulderRecoilPoser.FullCrouchScale, 1f, Mathf.Clamp01(movementContext.SmoothedPoseLevel));
+
+        _shoulderRecoilPoser.Apply(localPlayer, rightHandWeight, markers, fadeReason, scale, Plugin.ShoulderRecoil.Value);
+    }
+
+    /// <summary>
+    ///     From the ProceduralWeaponAnimation.Shoot postfix, for the local player's shots. str is the shot's recoil
+    ///     multiplier from the firearm controller (ammo, double barrel).
+    /// </summary>
+    public void OnShotFired(EFT.Animations.ProceduralWeaponAnimation pwa, float str)
+    {
+        _shoulderRecoilPoser?.OnShot(pwa, str, Plugin.ShoulderRecoil.Value);
     }
 
     private void HandleInputs()
@@ -338,7 +446,9 @@ public class ThirdPersonView : MonoBehaviour
         if (localPlayer.CameraPosition == null || !localPlayer.HealthController.IsAlive)
             return;
 
-        // Before the 1st person early returns: it is the same body in either view
+        // Before the 1st person early returns: it is the same body in either view. Walk tracking first, the torso
+        // deadzone hands over to the moving one from what it finds.
+        UpdateWalkTracking();
         UpdateTorsoDeadzone();
 
         // Before the early returns too, so an orbit is dropped on any frame that is not 3rd person
@@ -516,9 +626,101 @@ public class ThirdPersonView : MonoBehaviour
             return;
         }
 
+        // The limit does nothing while walking, but a turn started from the twist seen there would carry into standing.
+        // The plain deadzone instead: stopping inside it leaves the legs where they are, beyond it starts a clean turn.
+        if (_movingDeadzoneInControl)
+        {
+            localPlayer.TrunkRotationLimit = _torsoDeadzone.Hold(Plugin.TorsoAimDeadzone.Value);
+            return;
+        }
+
         localPlayer.TrunkRotationLimit = _torsoDeadzone.Update(
             movementContext.HandsToBodyAngle, Plugin.TorsoAimDeadzone.Value, Plugin.BodyTurnSpeed.Value, Time.deltaTime
         );
+    }
+
+    /// <summary>
+    ///     Whether the moving deadzone drives this walking state: the local player's, in real 3rd person with the look
+    ///     captured, and the setting on. The one rule shared by both MovePlayerState patches and the standing hand-off,
+    ///     so they cannot disagree. The caller has already checked the state is exactly MovePlayerState. The context
+    ///     test comes first: every bot's walking state asks.
+    /// </summary>
+    public bool IsMovingDeadzoneFor(MovementContext movementContext)
+    {
+        return movementContext == localPlayer.MovementContext && Plugin.MovingTorsoDeadzone.Value > 0f && IsCapturingLook;
+    }
+
+    /// <summary>
+    ///     From the MovePlayerState.UpdateRotation patch (animator pass): the walking state's new leg yaw.
+    /// </summary>
+    public float StepWalkingLegs(float legYaw, float lookYaw, float deltaTime)
+    {
+        return _movingDeadzone.Step(
+            legYaw, lookYaw, Plugin.MovingTorsoDeadzone.Value, Plugin.BodyTurnSpeed.Value, Plugin.MovingRecentreSpeed.Value, _walkBlocked, deltaTime
+        );
+    }
+
+    /// <summary>
+    ///     The plain walking state, not its sprint and prone-move subclasses (nor Fika's observed ones, which are never the
+    ///     local player's). The game creates the walking state as exactly MovePlayerState (MovementContext.GetNewState).
+    /// </summary>
+    private static MovePlayerState GetWalkingState(MovementContext movementContext)
+    {
+        var state = movementContext.CurrentState;
+        return state != null && state.GetType() == typeof(MovePlayerState) ? (MovePlayerState)state : null;
+    }
+
+    /// <summary>
+    ///     Once per LateUpdate, after this frame's animator pass: the measured horizontal velocity, the walking input, and
+    ///     whether the walk is blocked (input held, walking, barely moving for longer than the grace time). Blocked legs
+    ///     square up, which also keeps the game's wall lock working: it lets go whenever the body is twisted over 5 degrees.
+    /// </summary>
+    private void UpdateWalkTracking()
+    {
+        var movementContext = localPlayer.MovementContext;
+        if (movementContext == null)
+            return;
+
+        var deltaTime = Time.deltaTime;
+        var position = movementContext.TransformPosition;
+        if (_hasLastPlayerPosition && deltaTime > 0f)
+        {
+            var moved = position - _lastPlayerPosition;
+            _horizontalVelocity = new Vector3(moved.x, 0f, moved.z) / deltaTime;
+        }
+        else
+        {
+            _horizontalVelocity = Vector3.zero;
+        }
+
+        _lastPlayerPosition = position;
+        _hasLastPlayerPosition = true;
+
+        var walking = GetWalkingState(movementContext);
+        // Raw again by now: the walking state only holds the converted direction inside its update
+        _walkInput = walking != null ? walking.Direction : Vector2.zero;
+
+        if (walking != null && _walkInput.sqrMagnitude > WalkInputMinSqr && _horizontalVelocity.sqrMagnitude < WalkBlockedSpeed * WalkBlockedSpeed)
+            _walkBlockedTime += deltaTime;
+        else
+            _walkBlockedTime = 0f;
+
+        _walkBlocked = _walkBlockedTime > WalkBlockedGraceTime;
+        _movingDeadzoneInControl = walking != null && IsMovingDeadzoneFor(movementContext);
+    }
+
+    /// <summary>
+    ///     Signed angle (degrees) from the direction the held walk input means relative to the aim to the measured
+    ///     horizontal velocity, or NaN when not walking or too slow to tell. For judging in game whether travel stays
+    ///     aim-relative while the legs lag.
+    /// </summary>
+    private float GetTravelError()
+    {
+        if (_walkInput.sqrMagnitude <= WalkInputMinSqr || _horizontalVelocity.sqrMagnitude < TravelErrorMinSpeed * TravelErrorMinSpeed)
+            return float.NaN;
+
+        var intended = Quaternion.Euler(0f, localPlayer.MovementContext.Yaw, 0f) * new Vector3(_walkInput.x, 0f, _walkInput.y);
+        return Vector3.SignedAngle(intended, _horizontalVelocity, Vector3.up);
     }
 
     /// <summary>
@@ -670,9 +872,9 @@ public class ThirdPersonView : MonoBehaviour
 
     /// <summary>
     ///     The camera pivot: the eye moved by Body Bob's share of the difference between its filtered and raw offsets from
-    ///     the body. That is anchor + yaw * Lerp(raw, filtered, weight), with the anchor moving 1:1 with the character so
-    ///     only the body-relative bob is smoothed, never the travel. Everything but the filtered offset is read live, so
-    ///     the aim solve in Update sees this frame's root motion. Exactly the eye while bypassed.
+    ///     the body, plus the trail's lag behind the travel. That is anchor + lag + yaw * Lerp(raw, filtered, weight): the
+    ///     filter smooths only the body-relative bob, the trail only the travel. Everything but the filtered offset and
+    ///     the lag is read live, so the aim solve in Update sees this frame's root motion. Exactly the eye while bypassed.
     /// </summary>
     private Vector3 GetPivotPosition(Transform eyeTransform)
     {
@@ -681,7 +883,9 @@ public class ThirdPersonView : MonoBehaviour
         if (IsPivotFilterBypassed || !TryGetPivotFrame(eye, out var yaw, out var raw))
             return eye;
 
-        var pivot = eye + yaw * ((_pivotFilter.Offset - raw) * _bodyBobWeight);
+        // The trail lag is added before the clamp, so a pivot left behind a corner the character has just walked round is
+        // pulled back to the eye's side of it like any other pivot offset
+        var pivot = eye + yaw * ((_pivotFilter.Offset - raw) * _bodyBobWeight) + _pivotTrail.Lag;
         return ClampPivotToEye(eye, pivot);
     }
 
@@ -749,18 +953,36 @@ public class ThirdPersonView : MonoBehaviour
         var deltaTime = Time.deltaTime;
         _bodyBobWeight = Mathf.MoveTowards(_bodyBobWeight, Mathf.Clamp01(Plugin.BodyBob.Value), BodyBobWeightRate * deltaTime);
 
-        if (!TryGetPivotFrame(eyeTransform.position, out _, out var raw))
+        // ADS in 3rd person aims precisely, the camera stays on the character there (1st person ADS is bypassed anyway)
+        // Read live: _handsController is only refreshed after this runs
+        var handsController = localPlayer.HandsController as Player.ItemHandsController;
+        var aiming = handsController != null && handsController.IsAiming;
+        var followScale = aiming ? 0f : 1f;
+        _followDeadzone = Mathf.MoveTowards(_followDeadzone, Mathf.Max(0f, Plugin.CameraFollowDeadzone.Value) * followScale, FollowDeadzoneRate * deltaTime);
+        _followSmoothing = Mathf.MoveTowards(_followSmoothing, Mathf.Max(0f, Plugin.CameraFollowSmoothing.Value) * followScale, FollowSmoothingRate * deltaTime);
+
+        var eye = eyeTransform.position;
+        if (!TryGetPivotFrame(eye, out var yaw, out var raw))
         {
             _pivotFilter.Reset();
+            _pivotTrail.Reset();
             return;
         }
 
         _pivotRawOffset = raw;
+        // The frame's anchor: the trail follows the character's travel, the filter its eye relative to that
+        var anchor = eye - yaw * raw;
 
         if (IsPivotFilterBypassed)
+        {
             _pivotFilter.Snap(raw);
+            _pivotTrail.Snap(anchor);
+        }
         else
+        {
             _pivotFilter.Step(raw, deltaTime);
+            _pivotTrail.Step(anchor, _followDeadzone, _followSmoothing, deltaTime);
+        }
     }
 
     /// <summary>
@@ -989,7 +1211,10 @@ public class ThirdPersonView : MonoBehaviour
             return false;
         }
 
-        ribcage = ribcageBone.Original.position;
+        // Where the hands were placed this frame: the shoulder recoil pose may still be moving the ribcage when Update
+        // runs ahead of its restore
+        if (_shoulderRecoilPoser == null || !_shoulderRecoilPoser.TryGetRibcagePositionBeforePose(out ribcage))
+            ribcage = ribcageBone.Original.position;
         // Low-passed every LateUpdate, toward zero without a firearm, so it is valid whatever is in hands
         muzzleOffset = _aimSolver.MuzzleOffset;
         pivot = GetPivotPosition(eyeTransform);
@@ -1249,8 +1474,12 @@ public class ThirdPersonView : MonoBehaviour
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Line Scan Radius P1: {_positionSolver.Phase1.LineScanRadius} P2: {_positionSolver.Phase2.LineScanRadius} P3: {_positionSolver.Phase3.LineScanRadius}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Player Velocity: {localPlayer.Velocity} Motion: {localPlayer.Motion} Rot: {localPlayer.MovementContext.Rotation}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Hands To Body: {localPlayer.MovementContext.HandsToBodyAngle:F2} Trunk Limit: {localPlayer.TrunkRotationLimit:F2} Turning: {_torsoDeadzone.IsTurning} Prone Hold: {_torsoProneHold}", centered: false);
+            var travelError = GetTravelError();
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Moving Deadzone: {(_movingDeadzoneInControl ? "In control" : "Off")} Mode: {_movingDeadzone.Mode} Lag: {_movingDeadzone.Lag:F2} Blocked: {_walkBlocked} ({_walkBlockedTime:F2}s) | Speed: {_horizontalVelocity.magnitude:F2}m/s Travel Error: {(float.IsNaN(travelError) ? "-" : travelError.ToString("F2"))}", centered: false);
             var gait = _gaitPoser.Gait;
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Gait: Feet Sep: {_gaitPoser.FootSeparation:F2} Move W: {_gaitPoser.MovementWeight:F2}{(_gaitPoser.Airborne ? " (air)" : "")} Master: {_gaitPoser.Master:F2}{(_gaitPoser.Suppression != null ? " (" + _gaitPoser.Suppression + ")" : "")} Intensity: {_gaitPoser.Intensity:F2} | Dip Target: {gait.DipTarget * 100f:F2}cm Dip: {gait.Dip * 100f:F2}cm Sway: {gait.Sway * 100f:F2}cm Sag: {gait.Sag:F2} Head: {gait.Head:F2}", centered: false);
+            var recoil = _shoulderRecoilPoser;
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Shoulder Recoil: Last Shot Back: {recoil.LastBack:F0} ({recoil.LastSource}) Class: {recoil.LastClassFactor:F2} Kick: {recoil.LastKick:F2} | Push: {recoil.Push * 100f:F2}cm = Rock {recoil.RockPush * 100f:F2}cm ({recoil.RockDegrees:F2}deg) + Twist {recoil.TwistPush * 100f:F2}cm ({recoil.TwistDegrees:F2}deg) + Clavicle {recoil.ClaviclePush * 100f:F2}cm ({recoil.ClavicleDegrees:F2}deg, {(recoil.ClavicleActive ? "on" : "off")}) Head: {recoil.HeadMove * 100f:F2}cm | Chain: {recoil.ChainLength} Reach Rock: {recoil.RockReach:F2} Rest: {recoil.RestReach:F2} | R Hand IK: {recoil.RightHandWeight:F3} Master: {recoil.Master:F2}{(recoil.Suppression != null ? " (" + recoil.Suppression + ")" : "")} Intensity: {recoil.Intensity:F2}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Capturing: {IsCapturingLook} Default RotAction: {localPlayer.MovementContext.RotationAction == MovementContext.DefaultRotationFunction} BTR: {localPlayer.BtrState}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Free Look Orbit Held: {_orbitHeld} Offset Yaw: {_rig.OrbitYaw:F2} Pitch: {_rig.OrbitPitch:F2} | Game MouseLookControl: {localPlayer.MouseLookControl} Resetting: {localPlayer.IsResettingLook} Head: {localPlayer.HeadRotation.ToString("F1")}", centered: false);
             var playerRotation = localPlayer.MovementContext.Rotation;
@@ -1267,6 +1496,7 @@ public class ThirdPersonView : MonoBehaviour
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Offset: {_currentOffset} Aim Offset: {_aimOffset}{(_aimOffsetDetached ? " (detached)" : "")} PWA Offset: {pwa.HandsContainer.CameraOffset}", centered: false);
             var pivotFiltered = _pivotFilter.Offset;
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Pivot Offset Raw: {_pivotRawOffset.ToString("F3")} Filtered: {pivotFiltered.ToString("F3")} Bob Shown: {((_pivotRawOffset - pivotFiltered) * _bodyBobWeight).ToString("F3")} Weight: {_bodyBobWeight:F2} Bypassed: {_pivotFilter.Bypassed}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Pivot Trail: {_pivotTrail.State} Lag: {_pivotTrail.Lag.magnitude * 100f:F1}cm Past Deadzone: {_pivotTrail.Excess * 100f:F1}cm ({_pivotTrail.Excess / PivotTrail.MaxTrail:P0} of cap) | Applied Deadzone: {_followDeadzone:F3}m Smoothing: {_followSmoothing:F3}s", centered: false);
             if (camTransform != null)
             {
                 rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Pos: {camTransform.position} Local: {camTransform.localPosition}", centered: false);

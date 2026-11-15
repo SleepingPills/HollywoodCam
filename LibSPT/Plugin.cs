@@ -58,6 +58,8 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<KeyCode> CameraShoulderKey;
     public static ConfigEntry<float> CameraMoveSpeed;
     public static ConfigEntry<float> BodyBob;
+    public static ConfigEntry<float> CameraFollowDeadzone;
+    public static ConfigEntry<float> CameraFollowSmoothing;
     public static ConfigEntry<float> AimConvergenceMinDistance;
     public static ConfigEntry<float> AimConvergenceSpeed;
     public static ConfigEntry<float> FreeLookMaxAngle;
@@ -90,7 +92,10 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<float> FlinchScale;
     public static ConfigEntry<float> TorsoAimDeadzone;
     public static ConfigEntry<float> BodyTurnSpeed;
+    public static ConfigEntry<float> MovingTorsoDeadzone;
+    public static ConfigEntry<float> MovingRecentreSpeed;
     public static ConfigEntry<float> GaitWeight;
+    public static ConfigEntry<float> ShoulderRecoil;
     public static ConfigEntry<float> InteractionRange;
     
     public static ConfigEntry<bool> DebugUIEnabled;
@@ -120,6 +125,8 @@ public class Plugin : BaseUnityPlugin
         new PlayerCameraControllerLateUpdatePrefixPatch().Enable();
         new ProceduralWeaponAnimationSetStrategyPrefixPatch().Enable();
         new PlayerFBBIKUpdatePostfixPatch().Enable();
+        new ProceduralWeaponAnimationShootPostfixPatch().Enable();
+        new PlayerIkProcessPrefixPatch().Enable();
 
         // Look
         new MoveInputTranslatorTranslateAxesPatch().Enable();
@@ -128,6 +135,8 @@ public class Plugin : BaseUnityPlugin
 
         // Movement
         new SideStepPlayerStateEnterPrefixPatch().Enable();
+        new MovePlayerStateUpdateRotationPrefixPatch().Enable();
+        new MovePlayerStateConvertDirectionFromLocalToGlobalPrefixPatch().Enable();
 
         // Player
         new PlayerConstructorPostfixPatch().Enable();
@@ -297,6 +306,20 @@ public class Plugin : BaseUnityPlugin
             new AcceptableValueRange<float>(0f, 1f),
             tags: new ConfigurationManagerAttributes { Order = 0 }
         ));
+        CameraFollowDeadzone = Config.Bind(headerCamera, "Camera Follow Deadzone", 0.0f, new ConfigDescription(
+            "How far (in meters) the character can move sideways or forwards before the camera starts to follow, so small " +
+            "steps and direction changes show as the character moving in the frame. Height changes are always followed. " +
+            "Not used while aiming down sights. 0 together with Camera Follow Smoothing 0 keeps the camera rigidly on the character.",
+            new AcceptableValueRange<float>(0f, 0.5f),
+            tags: new ConfigurationManagerAttributes { Order = -1 }
+        ));
+        CameraFollowSmoothing = Config.Bind(headerCamera, "Camera Follow Smoothing", 0.1f, new ConfigDescription(
+            "How long (in seconds) the camera takes to catch up with the character once it is past the deadzone. Higher " +
+            "values trail further behind; however fast the character runs, the camera never falls more than 0.25 meters " +
+            "behind the deadzone edge. Not used while aiming down sights.",
+            new AcceptableValueRange<float>(0f, 0.5f),
+            tags: new ConfigurationManagerAttributes { Order = -2 }
+        ));
 
         CrosshairEnabled = Config.Bind(headerCrosshair, "Enable Crosshair", true, new ConfigDescription(
             "Toggles the world space crosshair in third person view.",
@@ -316,7 +339,7 @@ public class Plugin : BaseUnityPlugin
             tags: new ConfigurationManagerAttributes { Order = 1 }
         ));
 
-        SprintFovChange = Config.Bind(headerSprint, "Sprint FoV Change", 15, new ConfigDescription(
+        SprintFovChange = Config.Bind(headerSprint, "Sprint FoV Change", 25, new ConfigDescription(
             "How much to change the FoV during sprinting in third person. This is relative to the baseline FoV. Positive numbers open up the FoV for " +
             "more peripheral vision. Negative numbers apply tunnel vision because you are a masochist.",
             new AcceptableValueRange<int>(-100, 100),
@@ -331,26 +354,42 @@ public class Plugin : BaseUnityPlugin
         InteractionRayRadius = Config.Bind(headerMisc, "Interaction Radius", 0.1f, new ConfigDescription(
             "The radius of the raycast for picking interactable objects (in meters).",
             new AcceptableValueRange<float>(0.01f, 0.1f),
-            tags: new ConfigurationManagerAttributes { Order = 6 }
+            tags: new ConfigurationManagerAttributes { Order = 8 }
         ));
         FlinchScale = Config.Bind(headerMisc, "Flinch Amount", 0.35f, new ConfigDescription(
             "How much flinch is applied when shot. A small value goes a long way. Set to 5 if you want to larp being a bobble head.",
             new AcceptableValueRange<float>(0f, 5f),
-            tags: new ConfigurationManagerAttributes { Order = 5 }
+            tags: new ConfigurationManagerAttributes { Order = 7 }
         ));
-        TorsoAimDeadzone = Config.Bind(headerMisc, "Torso Aim Deadzone", 35f, new ConfigDescription(
+        TorsoAimDeadzone = Config.Bind(headerMisc, "Torso Aim Deadzone", 45f, new ConfigDescription(
             "How far (in degrees) the character can aim with the upper body while standing still before the legs turn. " +
             "0 makes the body always follow the aim. 45 is the game's own value and the most the animations allow: past it " +
             "the game plays a turn-in-place animation that turns the legs regardless. Not used while prone, which keeps the " +
-            "game's own limit.",
+            "game's own limit. Walking uses the Moving Torso Deadzone instead.",
             // Capped at 45: the Turn_Left/Right_90_Aim animator states take over beyond it (see TorsoDeadzone)
             new AcceptableValueRange<float>(0f, 45f),
+            tags: new ConfigurationManagerAttributes { Order = 6 }
+        ));
+        MovingTorsoDeadzone = Config.Bind(headerMisc, "Moving Torso Deadzone", 25f, new ConfigDescription(
+            "How far (in degrees) the aim can move away from the legs while walking before the legs turn to follow at " +
+            "Body Turn Speed. Only changes how the legs look: walking still goes where you aim. 0 keeps the legs locked " +
+            "to the aim while walking, as the game does. Sprinting always faces the direction of travel.",
+            // Kept well under 26.6, where the game's discrete walk direction switches to a diagonal
+            new AcceptableValueRange<float>(0f, 40f),
+            tags: new ConfigurationManagerAttributes { Order = 5 }
+        ));
+        BodyTurnSpeed = Config.Bind(headerMisc, "Body Turn Speed", 120f, new ConfigDescription(
+            "How fast (in degrees per second) the legs turn to follow the aim once it leaves the Torso Aim Deadzone " +
+            "(standing still) or the Moving Torso Deadzone (walking). Standing still, 0 keeps the legs trailing at the edge " +
+            "of the deadzone instead of re-centring, which is the game's native behaviour; walking, 0 makes the legs keep " +
+            "up with the edge of the deadzone at once.",
+            new AcceptableValueRange<float>(0f, 720f),
             tags: new ConfigurationManagerAttributes { Order = 4 }
         ));
-        BodyTurnSpeed = Config.Bind(headerMisc, "Body Turn Speed", 240f, new ConfigDescription(
-            "How fast (in degrees per second) the legs re-orient to face the aim once it leaves the Torso Aim Deadzone. " +
-            "0 keeps the legs trailing at the edge of the deadzone instead of re-centring, which is the game's native behaviour.",
-            new AcceptableValueRange<float>(0f, 720f),
+        MovingRecentreSpeed = Config.Bind(headerMisc, "Moving Recentre Speed", 30f, new ConfigDescription(
+            "How fast (in degrees per second) the legs square up to the aim while walking with the aim inside the Moving " +
+            "Torso Deadzone. 0 holds them where they are until the aim leaves the deadzone.",
+            new AcceptableValueRange<float>(0f, 180f),
             tags: new ConfigurationManagerAttributes { Order = 3 }
         ));
         GaitWeight = Config.Bind(headerMisc, "Gait Weight", 1f, new ConfigDescription(
@@ -358,6 +397,13 @@ public class Plugin : BaseUnityPlugin
             "instead of gliding. Bigger strides (sprinting) dip more, and landings from a jump or fall dip too. 1 is the intended " +
             "amount, 2 doubles it. 0 turns it off.",
             new AcceptableValueRange<float>(0f, 2f),
+            tags: new ConfigurationManagerAttributes { Order = 2 }
+        ));
+        ShoulderRecoil = Config.Bind(headerMisc, "Shoulder Recoil", 1.5f, new ConfigDescription(
+            "Rocks the upper body back along the gun with each shot in third person, firing shoulder first, so the body visibly " +
+            "takes the recoil. Harder kicking guns push harder; shotguns and bolt actions the most, pistols the least. Purely cosmetic: " +
+            "it does not change the recoil, the aim or where the bullets go. 1 is the intended amount, 3 triples it. 0 turns it off.",
+            new AcceptableValueRange<float>(0f, 3f),
             tags: new ConfigurationManagerAttributes { Order = 2 }
         ));
         InteractionRange = Config.Bind(headerMisc, "3rd Person Interaction Range (RESTART)", 3.5f, new ConfigDescription(

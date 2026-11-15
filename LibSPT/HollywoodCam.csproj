@@ -118,6 +118,7 @@
     <Compile Include="Patches\BattleUI.cs" />
     <Compile Include="Patches\Lifecycle.cs" />
     <Compile Include="Patches\Player.cs" />
+    <Compile Include="Patches\Recoil.cs" />
     <Compile Include="Patches\Camera.cs" />
     <Compile Include="Plugin.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
@@ -125,7 +126,11 @@
     <Compile Include="CameraRig.cs" />
     <Compile Include="GaitPoser.cs" />
     <Compile Include="GaitWeight.cs" />
+    <Compile Include="MovingDeadzone.cs" />
     <Compile Include="PivotFilter.cs" />
+    <Compile Include="PivotTrail.cs" />
+    <Compile Include="ShoulderRecoil.cs" />
+    <Compile Include="ShoulderRecoilPoser.cs" />
     <Compile Include="StaticData.cs" />
     <Compile Include="TorsoDeadzone.cs" />
     <Compile Include="Utils.cs" />

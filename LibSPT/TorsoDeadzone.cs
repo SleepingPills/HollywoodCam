@@ -71,4 +71,14 @@ public class TorsoDeadzone
     {
         IsTurning = false;
     }
+
+    /// <summary>
+    ///     Drops a turn in progress and returns the plain deadzone as the limit, for while the walking legs are driven by
+    ///     MovingDeadzone. Coming to a stop then starts from a clean state with the lag the walk left.
+    /// </summary>
+    public float Hold(float deadzone)
+    {
+        IsTurning = false;
+        return Limit = Mathf.Max(0f, deadzone);
+    }
 }
