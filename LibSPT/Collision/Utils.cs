@@ -42,6 +42,25 @@ public static class CollisionUtils
 
 
     /// <summary>
+    ///     A counted sphere cast that never hits triggers. Like every cast it does not see a collider it starts inside.
+    /// </summary>
+    public static bool SphereCastHit(Vector3 origin, float radius, Vector3 direction, out RaycastHit hit, float maxDistance, int layerMask)
+    {
+        CastCount++;
+        return Physics.SphereCast(origin, radius, direction, out hit, maxDistance, layerMask, QueryTriggerInteraction.Ignore);
+    }
+
+    /// <summary>
+    ///     A counted overlap test that never sees triggers. It finds geometry the sphere touches, not a sphere wholly inside
+    ///     a closed mesh, which has no surface near it.
+    /// </summary>
+    public static bool CheckSphere(Vector3 position, float radius, int layerMask)
+    {
+        CastCount++;
+        return Physics.CheckSphere(position, radius, layerMask, QueryTriggerInteraction.Ignore);
+    }
+
+    /// <summary>
     ///     A counted raycast that never hits triggers.
     /// </summary>
     public static bool Raycast(Vector3 origin, Vector3 direction, out RaycastHit hit, float maxDistance, int layerMask)

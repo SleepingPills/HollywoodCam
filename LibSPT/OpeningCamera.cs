@@ -15,8 +15,7 @@ public struct OpeningCheck
     public bool OrdinaryReachable;
     // The opening camera's position: how far its centre ray passes from the character, whether a cast from the head to it
     // is blocked (it is round a corner from the head), how many of the eye's view samples have a clear line back to it
-    // (out of how many there are), whether it overlaps geometry it could not be moved out of (for a position not yet in
-    // use: whether it overlaps at all), and its distance from the eye
+    // (out of how many there are), whether it overlaps geometry, and its distance from the eye
     public float CameraCover;
     public bool HiddenFromHead;
     public int Seen;
@@ -96,16 +95,8 @@ public class OpeningCamera
     public const float RetreatMaxTime = 1f;
     // Longest the camera may take to get out through the opening to its waypoint when bootstrapping
     public const float TravelMaxTime = 0.6f;
-    // The caller moves a camera found overlapping geometry back out (depenetration, or its last clear position). Only if
-    // that keeps failing for this long is the camera stuck inside something, and the mode cuts: a cut shows the collapsed
-    // view the mode exists to avoid, so a single bad frame (a rough mesh, a door leaf brushing past) must not cause one
-    public const float StuckCutTime = 0.25f;
-    // A first cut lets the mode start again at once (by its bootstrap, if the camera is behind the head). A second cut within
-    // CutRepeatWindow of the last one means the same conditions keep ending it badly, and the mode then stays off for
-    // CutCooldown, so it cannot cut and re-enter frame after frame (simulated before overlaps were resolved: 54 cuts in a
-    // second, each re-entry flagging the same overlap)
-    public const float CutRepeatWindow = 2f;
-    public const float CutCooldown = 1f;
+    // After a cut the mode stays off this long
+    public const float CutCooldown = 0.5f;
 
     // The camera is a sphere of this radius, the solver's middle phase radius: the same clearance from walls
     public const float CameraRadius = 0.09f;
@@ -134,9 +125,7 @@ public class OpeningCamera
     private float _leanLowSince = -1f;
     private float _travelSince;
     private float _retreatSince;
-    private float _stuckSince = -1f;
     private float _cutTime = float.NegativeInfinity;
-    private float _cooldownUntil = float.NegativeInfinity;
 
     /// <summary>
     ///     The view samples a position must be seen by to start the mode, out of how many the eye has.
@@ -216,16 +205,7 @@ public class OpeningCamera
     public OpeningAction Update(in OpeningCheck check, float time, bool describe)
     {
         if (check.Overlap)
-        {
-            if (_stuckSince < 0f)
-                _stuckSince = time;
-            if (time - _stuckSince >= StuckCutTime)
-                return Leave(OpeningAction.Cut, "cut: stuck in geometry", time);
-            Reason = "overlapping, could not move out yet";
-            return OpeningAction.Stay;
-        }
-
-        _stuckSince = -1f;
+            return Leave(OpeningAction.Cut, "cut: overlaps geometry", time);
 
         if (check.Seen < Mathf.Min(SeenToStay, check.Samples))
             return Retreat(time, "retreating: view samples no longer see it");
@@ -287,7 +267,7 @@ public class OpeningCamera
     {
         State = Phase.Off;
         Travelling = Bootstrapped = false;
-        _handoverSince = _leanLowSince = _stuckSince = -1f;
+        _handoverSince = _leanLowSince = -1f;
         Reason = reason;
     }
 
@@ -305,17 +285,14 @@ public class OpeningCamera
     {
         Reset(reason);
         if (action == OpeningAction.Cut)
-        {
-            if (time - _cutTime < CutRepeatWindow)
-                _cooldownUntil = time + CutCooldown;
             _cutTime = time;
-        }
-
         return action;
     }
 
     /// <summary>
-    ///     Whether the mode may not start again yet: only after a repeated cut (see CutRepeatWindow).
+    ///     Whether the mode may start again: not for CutCooldown after a cut, or the same conditions that ended it badly
+    ///     could restart it every other frame (simulated: a camera started against a jamb flagged as overlapping, cut and
+    ///     re-entered 54 times in a second).
     /// </summary>
-    public bool CoolingDown(float time) => time < _cooldownUntil;
+    public bool CoolingDown(float time) => time - _cutTime < CutCooldown;
 }

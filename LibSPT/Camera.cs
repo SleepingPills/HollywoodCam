@@ -142,32 +142,13 @@ public class ThirdPersonView : MonoBehaviour
     // the way: the solver's finest phase radius, and short enough that only the jamb, not a graze, counts
     private const float OpeningHeadCastRadius = 0.05f;
     private const float OpeningHeadClearScore = 0.95f;
+    // Overlap is tested with a sphere this small: it is for a camera inside geometry (a door swung onto it), not one close
+    // to a surface, and the ordinary solve hands over cameras within a few centimetres of a jamb (its finest phase keeps
+    // only 0.05 m)
+    private const float OpeningOverlapRadius = 0.02f;
     // The aim point is held while a bootstrap carries the camera out through the opening, for this long past its travel
     private const float OpeningHoldMargin = 0.5f;
-    // The opening camera counts as clear when a sphere this much bigger than the swept one (half the skin) touches nothing.
-    // Unity reports colliders a sweep starts touching, which stops the move; if that test were looser than this one, a
-    // camera could rest where every move stops yet nothing is resolved, and freeze.
-    private const float OpeningClearance = OpeningCamera.CameraRadius + CameraSweep.Skin * 0.5f;
-    // A push out of an overlap longer than this is refused: a touching sphere needs its own size plus the skin at most,
-    // and a longer push means the camera was inside a solid, where the nearest way out can be the far side of a wall
-    private const float OpeningMaxPush = OpeningClearance + CameraSweep.Skin;
     private bool _openingBootstrapped;
-    // Moves the opening camera (and the bootstrap's probes) as a sphere; the player's own colliders are not obstacles
-    private CameraSweep _sweep;
-    // Where the camera's full sphere was last found clear, for when it is found overlapping something it cannot be pushed
-    // out of; valid only while the mode holds the camera
-    private Vector3 _openingLastClear;
-    private bool _openingLastClearValid;
-    // Whether the camera was overlapping last frame, so a run of overlapping frames is one occurrence (logged once)
-    private bool _openingOverlapping;
-    // What the camera's last move stopped at: a reference written every move, described only when the mode retreats or cuts
-    private Collider _openingMoveBlocker;
-    // For the debug UI and the log, built only at the events themselves and only when either can show them: how many
-    // overlap occurrences there were, the last one's collider and how it was resolved, and what the camera had stopped at
-    // when the mode last retreated or cut
-    private int _openingOverlapEvents;
-    private string _openingOverlapInfo;
-    private string _openingBlockerInfo;
     // For the debug UI
     private OpeningCheck _openingCheck;
     private string _openingStatus = "Off";
@@ -348,7 +329,6 @@ public class ThirdPersonView : MonoBehaviour
 
         _visibilityMask = _eyeCameraHitMask & ~LayerBit("TransparentCollider") & ~LayerBit("Deadbody");
         _intent = new IntentProbe(_visibilityMask, _aimSolver.IsIgnored, IsSeeThrough);
-        _sweep = new CameraSweep(_aimSolver.IsIgnored);
         for (var i = 0; i < _levelViews.Length; i++)
             _levelViews[i] = new TargetView[IntentProbe.MaxTargets];
 
@@ -402,7 +382,6 @@ public class ThirdPersonView : MonoBehaviour
         _gaitPoser?.Dispose();
 
         _rig?.Destroy();
-        _sweep?.Destroy();
 
         // Deferred: this runs inside the DestroyImmediate of Player.Dispose and Player.OnDead. Until the end of the frame
         // the overlay finds its view gone and draws nothing.
@@ -1180,7 +1159,6 @@ public class ThirdPersonView : MonoBehaviour
     {
         _opening.Reset(reason);
         _openingVelocity = Vector3.zero;
-        _openingLastClearValid = false;
         _openingStatus = reason;
     }
 
@@ -1241,20 +1219,18 @@ public class ThirdPersonView : MonoBehaviour
         var target = frame.TransformPoint(desired);
         var now = Time.time;
 
-        // The camera continuing from where it was, as the opening camera would move it. The solve can leave the camera
-        // closer to a surface than the sphere's radius (its finest phase keeps 0.05 m), and a sweep starting there would
-        // not see that surface: the start is pushed clear first, and if it cannot be the camera is not kept.
-        var r = OpeningCamera.CameraRadius;
-        var keptStart = _lastCameraWorld;
-        var keptClear = _sweep.Overlap(keptStart, OpeningClearance, _eyeCameraHitMask) == 0 || _sweep.Depenetrate(ref keptStart, OpeningClearance, _eyeCameraHitMask, OpeningMaxPush);
+        // The camera continuing from where it was, as the opening camera would move it
         var velocity = Vector3.zero;
-        var kept = keptClear ? StepOpeningCamera(keptStart, target, OpeningCamera.SmoothTime, ref velocity) : keptStart;
-        _openingCheck = MeasureOpening(kept, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true, !keptClear);
+        var kept = MoveOpeningCamera(_lastCameraWorld, target, OpeningCamera.SmoothTime, ref velocity);
+        _openingCheck = MeasureOpening(kept, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true);
         var keptCheck = _openingCheck;
         if (OpeningCamera.CanEnter(keptCheck))
         {
-            EnterOpening(now, false, default, kept, velocity);
+            _opening.Enter(now, false, default);
+            _openingCamera = kept;
+            _openingVelocity = velocity;
             _currentOffset = frame.InverseTransformPoint(kept);
+            _openingStatus = _opening.Reason;
             if (describe)
                 _openingCasts = CollisionUtils.CastCount - castsAtStart;
             return;
@@ -1262,20 +1238,26 @@ public class ThirdPersonView : MonoBehaviour
 
         // Out through the opening in the lean's direction, then back toward the offset, to see where that comes to rest
         var side = frame.right * Mathf.Sign(lean);
-        var way = _sweep.Move(castOrigin, castOrigin + side * OpeningCamera.BootstrapReach, r, _eyeCameraHitMask);
-        var rest = _sweep.Move(way, target, r, _eyeCameraHitMask);
-        var bootstrapCheck = MeasureOpening(rest, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true, false);
+        var way = CameraSweep.Move(castOrigin, castOrigin + side * OpeningCamera.BootstrapReach, OpeningCamera.CameraRadius, _eyeCameraHitMask);
+        var rest = CameraSweep.Move(way, target, OpeningCamera.CameraRadius, _eyeCameraHitMask);
+        var bootstrapCheck = MeasureOpening(rest, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true);
         if (OpeningCamera.CanEnter(bootstrapCheck))
         {
-            // From the camera, pushed clear; if it cannot be, from the same point swept in from the head, which is clear
-            // (from the head always, it can stop well short of the camera: simulated jumps of half a metre)
-            var start = keptClear ? keptStart : _sweep.Move(castOrigin, _lastCameraWorld, r, _eyeCameraHitMask);
-            velocity = Vector3.zero;
-            var first = StepOpeningCamera(start, way, OpeningCamera.SmoothTime, ref velocity);
-            EnterOpening(now, true, way, first, velocity);
+            _opening.Enter(now, true, way);
             _openingCheck = bootstrapCheck;
-            _currentOffset = frame.InverseTransformPoint(first);
+            velocity = Vector3.zero;
+            // The squeezed camera the solve leaves can sit closer to the jamb than the sweep radius (its finest phase keeps
+            // 0.05 m), and a sweep that starts that close to a collider does not see it and passes into it. Then travel from
+            // the same point swept in from the head, which is clear; otherwise from the camera itself (from the head it can
+            // stop well short: simulated jumps of half a metre).
+            var start = CollisionUtils.CheckSphere(_lastCameraWorld, OpeningCamera.CameraRadius, _eyeCameraHitMask)
+                ? CameraSweep.Move(castOrigin, _lastCameraWorld, OpeningCamera.CameraRadius, _eyeCameraHitMask)
+                : _lastCameraWorld;
+            _openingCamera = MoveOpeningCamera(start, way, OpeningCamera.SmoothTime, ref velocity);
+            _openingVelocity = velocity;
+            _currentOffset = frame.InverseTransformPoint(_openingCamera);
             _openingBootstrapped = true;
+            _openingStatus = _opening.Reason;
         }
         else
         {
@@ -1304,21 +1286,9 @@ public class ThirdPersonView : MonoBehaviour
         var lean = localPlayer.MovementContext.SmoothedTilt;
         var retreating = _opening.State == OpeningCamera.Phase.Retreating;
 
-        // Out of anything it was found in first: a move from inside a collider would not see it
-        var clear = ResolveOpeningCamera(ref _openingCamera);
-
         // Toward the bootstrap waypoint, the head when retreating, or the offset
-        if (clear)
-        {
-            var goal = _opening.Travelling ? _opening.Waypoint : retreating ? castOrigin : frame.TransformPoint(desired);
-            _openingCamera = StepOpeningCamera(_openingCamera, goal, retreating ? OpeningCamera.RetreatSmoothTime : OpeningCamera.SmoothTime, ref _openingVelocity);
-            _openingMoveBlocker = _sweep.LastBlocker;
-        }
-        else
-        {
-            _openingVelocity = Vector3.zero;
-        }
-
+        var goal = _opening.Travelling ? _opening.Waypoint : retreating ? castOrigin : frame.TransformPoint(desired);
+        _openingCamera = MoveOpeningCamera(_openingCamera, goal, retreating ? OpeningCamera.RetreatSmoothTime : OpeningCamera.SmoothTime, ref _openingVelocity);
         if (_opening.Travelling && ((_openingCamera - _opening.Waypoint).sqrMagnitude < OpeningReachTolerance * OpeningReachTolerance || _opening.TravelExpired(now)))
             _opening.Arrived();
 
@@ -1336,13 +1306,11 @@ public class ThirdPersonView : MonoBehaviour
         {
             _intent.Sample(eye, _rig.Rotation, 0f);
             var ordinaryCover = TightSpaceCandidates.RayCoverDistance(ordinary, forward, body.Head, body.TorsoTop);
-            _openingCheck = MeasureOpening(_openingCamera, castOrigin, eye, body, forward, desired, lean, ordinaryCover, ordinary, false, !clear);
+            _openingCheck = MeasureOpening(_openingCamera, castOrigin, eye, body, forward, desired, lean, ordinaryCover, ordinary, false);
             action = _opening.Update(_openingCheck, now, _debug);
         }
 
         _openingStatus = _opening.Reason;
-        if (action is OpeningAction.Retreat or OpeningAction.Cut)
-            RecordOpeningBlocker(action);
         if (_debug)
             _openingCasts = CollisionUtils.CastCount - castsAtStart;
 
@@ -1350,137 +1318,40 @@ public class ThirdPersonView : MonoBehaviour
         {
             case OpeningAction.Handover:
                 _positionSolver.ResetVelocity();
-                _openingLastClearValid = false;
                 return frame.InverseTransformPoint(_openingCamera);
             case OpeningAction.Cut:
                 if (!body.Valid)
                     _opening.Reset("cut: no body");
                 _positionSolver.ResetVelocity();
-                _openingLastClearValid = false;
                 return ordinaryOffset;
             default:
                 return frame.InverseTransformPoint(_openingCamera);
         }
     }
 
-    private void EnterOpening(float now, bool bootstrapped, Vector3 waypoint, Vector3 camera, Vector3 velocity)
-    {
-        _opening.Enter(now, bootstrapped, waypoint);
-        _openingCamera = camera;
-        _openingVelocity = velocity;
-        _openingLastClear = camera;
-        _openingLastClearValid = true;
-        _openingOverlapping = false;
-        _openingStatus = _opening.Reason;
-    }
-
     /// <summary>
-    ///     Makes sure the opening camera's sphere is clear where it is. Found overlapping something (a rough mesh it slid onto,
-    ///     a crease, a door leaf swinging into it), it is pushed out by depenetration; failing that it goes back to where it
-    ///     was last found clear, if that is still clear. False only if neither works: the camera is stuck inside something,
-    ///     and OpeningCamera cuts once that has lasted StuckCutTime. One overlap query when clear.
-    /// </summary>
-    private bool ResolveOpeningCamera(ref Vector3 position)
-    {
-        if (_sweep.Overlap(position, OpeningClearance, _eyeCameraHitMask) == 0)
-        {
-            _openingLastClear = position;
-            _openingLastClearValid = true;
-            _openingOverlapping = false;
-            return true;
-        }
-
-        var overlapped = _sweep.LastOverlap;
-        string resolution;
-        var resolved = true;
-        var pushed = position;
-        if (_sweep.Depenetrate(ref pushed, OpeningClearance, _eyeCameraHitMask, OpeningMaxPush))
-        {
-            position = pushed;
-            _openingLastClear = position;
-            resolution = "pushed out";
-        }
-        else if (_openingLastClearValid && _sweep.Overlap(_openingLastClear, OpeningClearance, _eyeCameraHitMask) == 0)
-        {
-            position = _openingLastClear;
-            resolution = "back to last clear";
-        }
-        else
-        {
-            resolution = "could not move out";
-            resolved = false;
-        }
-
-        RecordOpeningOverlap(overlapped, resolution);
-        return resolved;
-    }
-
-    /// <summary>
-    ///     An overlap occurrence (the first frame of a run of them): counted, described for the debug UI and logged when
-    ///     either is on. Strings only at the event.
-    /// </summary>
-    private void RecordOpeningOverlap(Collider collider, string resolution)
-    {
-        if (_openingOverlapping)
-            return;
-
-        _openingOverlapping = true;
-        _openingOverlapEvents++;
-        if (!_debug && !Plugin.LoggingEnabled)
-            return;
-
-        _openingOverlapInfo = $"{DescribeCollider(collider)}, {resolution}";
-        if (Plugin.LoggingEnabled)
-            Plugin.Log.LogInfo($"Opening camera overlap #{_openingOverlapEvents}: {_openingOverlapInfo}");
-    }
-
-    /// <summary>
-    ///     What the camera's last move had stopped at when the mode retreats or cuts.
-    /// </summary>
-    private void RecordOpeningBlocker(OpeningAction action)
-    {
-        if (!_debug && !Plugin.LoggingEnabled)
-            return;
-
-        _openingBlockerInfo = $"{(action == OpeningAction.Cut ? "cut" : "retreat")}, last stopped at {DescribeCollider(_openingMoveBlocker)}";
-        if (Plugin.LoggingEnabled)
-            Plugin.Log.LogInfo($"Opening camera {_opening.Reason}: {_openingBlockerInfo}");
-    }
-
-    private static string DescribeCollider(Collider collider)
-    {
-        if (collider == null)
-            return "nothing";
-
-        var go = collider.gameObject;
-        return $"{collider.name} (root {collider.transform.root.name}, layer {LayerMask.LayerToName(go.layer)})";
-    }
-
-    /// <summary>
-    ///     One step of the opening camera from a clear position: eased toward the goal like the solver's phase 1, as a sweep,
-    ///     so it stops at and slides along what it meets. The velocity is what it actually moved, so pushing against a wall
+    ///     One step of the opening camera: eased toward the goal like the solver's phase 1, as a sweep from where it is, so
+    ///     it stops at and slides along what it meets. The velocity is what it actually moved, so pushing against a wall
     ///     does not wind it up.
     /// </summary>
-    private Vector3 StepOpeningCamera(Vector3 from, Vector3 goal, float smoothTime, ref Vector3 velocity)
+    private Vector3 MoveOpeningCamera(Vector3 from, Vector3 goal, float smoothTime, ref Vector3 velocity)
     {
         var deltaTime = Time.deltaTime;
         if (!(deltaTime > 0f))
             return from;
 
         var step = Vector3.SmoothDamp(from, goal, ref velocity, smoothTime / Plugin.CameraMoveSpeedScale, Mathf.Infinity, deltaTime);
-        var moved = _sweep.Move(from, step, OpeningCamera.CameraRadius, _eyeCameraHitMask);
+        var moved = CameraSweep.Move(from, step, OpeningCamera.CameraRadius, _eyeCameraHitMask);
         velocity = (moved - from) / deltaTime;
         return moved;
     }
 
     /// <summary>
-    ///     What OpeningCamera decides on, for a camera position. overlap is whether it is in something it could not be moved
-    ///     out of; for a candidate not yet in use, it is tested here. The ordinary target is swept to only when its cover could
-    ///     allow a handover. Casts: the view sample lines (stopping at need), maybe an overlap test and a sweep, and a head
-    ///     cast for the debug UI.
+    ///     What OpeningCamera decides on, for a camera position. The ordinary target is swept to only when its cover could
+    ///     allow a handover. Casts: an overlap test, a head cast, the view sample lines (stopping at need) and maybe a sweep.
     /// </summary>
     private OpeningCheck MeasureOpening(Vector3 camera, Vector3 castOrigin, Vector3 eye, in BodyShape body, Vector3 forward, Vector3 desired,
-        float lean, float ordinaryCover, Vector3 ordinary, bool entering, bool overlap)
+        float lean, float ordinaryCover, Vector3 ordinary, bool entering)
     {
         var check = new OpeningCheck
         {
@@ -1490,7 +1361,7 @@ public class ThirdPersonView : MonoBehaviour
             Distance = (camera - eye).magnitude,
             MaxDistance = desired.magnitude + OpeningCamera.DistanceSlack,
             Samples = _intent.Count,
-            Overlap = overlap || (entering && _sweep.Overlap(camera, OpeningCamera.CameraRadius, _eyeCameraHitMask) > 0),
+            Overlap = CollisionUtils.CheckSphere(camera, OpeningOverlapRadius, _eyeCameraHitMask),
             // No rule reads it (a retreat makes its own head cast), only the debug UI: a cast saved otherwise
             HiddenFromHead = _debug && CollisionUtils.SphereCast(castOrigin, camera, OpeningHeadCastRadius, _eyeCameraHitMask).Score < OpeningHeadClearScore
         };
@@ -1499,7 +1370,7 @@ public class ThirdPersonView : MonoBehaviour
         check.Seen = _intent.CountSeenBy(camera, OpeningCamera.CameraRadius, _eyeCameraHitMask, need);
 
         if (!entering && ordinaryCover >= OpeningCamera.HandoverCover)
-            check.OrdinaryReachable = (_sweep.Move(camera, ordinary, OpeningCamera.CameraRadius, _eyeCameraHitMask) - ordinary).sqrMagnitude
+            check.OrdinaryReachable = (CameraSweep.Move(camera, ordinary, OpeningCamera.CameraRadius, _eyeCameraHitMask) - ordinary).sqrMagnitude
                                       < OpeningReachTolerance * OpeningReachTolerance;
 
         return check;
@@ -2658,12 +2529,8 @@ public class ThirdPersonView : MonoBehaviour
             : "Off";
         var checks = c.Samples == 0
             ? ""
-            : $" | Ordinary cover {c.OrdinaryCover:F2}{(c.OrdinaryReachable ? " reachable" : "")} | Cam cover {c.CameraCover:F2} | Head {(c.HiddenFromHead ? "hidden" : "sees it")} | Seen {c.Seen}/{c.Samples} | {(c.Overlap ? "STUCK | " : "")}Dist {c.Distance:F2}/{c.MaxDistance:F2}";
-        // The last overlap occurrence (what it was, how it was resolved) and what the camera had stopped at when the mode
-        // last retreated or cut: what a report needs to tell which cause it was
-        var overlaps = _openingOverlapEvents == 0 ? "" : $" | Overlaps {_openingOverlapEvents}, last: {_openingOverlapInfo}";
-        var blocker = _openingBlockerInfo == null ? "" : $" | Last exit: {_openingBlockerInfo}";
-        return $"{state}: {_openingStatus} | Lean {lean:F1}{checks} ({_openingCasts} casts){overlaps}{blocker}";
+            : $" | Ordinary cover {c.OrdinaryCover:F2}{(c.OrdinaryReachable ? " reachable" : "")} | Cam cover {c.CameraCover:F2} | Head {(c.HiddenFromHead ? "hidden" : "sees it")} | Seen {c.Seen}/{c.Samples} | {(c.Overlap ? "OVERLAP | " : "")}Dist {c.Distance:F2}/{c.MaxDistance:F2}";
+        return $"{state}: {_openingStatus} | Lean {lean:F1}{checks} ({_openingCasts} casts)";
     }
 
     /// <summary>
