@@ -79,6 +79,42 @@ public class ThirdPersonView : MonoBehaviour
     // Time.time the hold window closes at, negative when closed
     private float _convergenceHoldUntil = -1f;
 
+    // Free look orbit (see Patches/Look.cs). Player.Look's own head return rate, so camera and head come back together.
+    private const float OrbitReturnRate = 15f;
+    // Set by free look input (the look axes only carry the mouse while the key is held), cleared by the game's
+    // ResetLookDirection, which the key's release sends
+    private bool _orbitHeld;
+
+    // The offset the aim maths models the camera at (see UpdateAimOffset). _currentOffset is collision-solved in the view
+    // frame, which an orbit swings away from the aim frame; re-used as is, an orbit into a wall would move the aim.
+    private Vector3 _aimOffset;
+    // Whether _aimOffset was frozen by an orbit and has not yet caught up with _currentOffset
+    private bool _aimOffsetDetached;
+    // Metres per second the aim offset eases back at after an orbit, so the aim drifts back rather than jumps
+    private const float AimOffsetCatchUpSpeed = 1f;
+
+    // Camera pivot, see GetPivotPosition. The filtered eye offset from the body, updated once per LateUpdate.
+    private readonly PivotFilter _pivotFilter = new();
+    // Last raw eye offset fed to the filter, for the debug UI
+    private Vector3 _pivotRawOffset;
+    // Body Bob as applied, eased toward the setting so changing it mid-raid does not jump the camera
+    private float _bodyBobWeight;
+    private const float BodyBobWeightRate = 2f;
+    // How far short of a hit between the eye and the pivot the pivot is pulled back to
+    private const float PivotCollisionSkin = 0.02f;
+    private const float PivotMinCastSqr = 1e-8f;
+    // Body yaw as of the last time it could be read, for a body pitched vertical
+    private Quaternion _lastBodyYaw = Quaternion.identity;
+    private bool _eyeChainLogged;
+
+    // Upper body aim deadzone, applied through Player.TrunkRotationLimit (see TorsoDeadzone)
+    private readonly TorsoDeadzone _torsoDeadzone = new();
+    // Whether the limit was last left to the game because the player is prone or getting in or out of it
+    private bool _torsoProneHold;
+
+    // Procedural weight on the walk and sprint cycle (see GaitPoser), applied from the Player.FBBIKUpdate postfix
+    private GaitPoser _gaitPoser;
+
     private EventHandler _adsModeOpticChanged;
     private EventHandler _adsModeBasicChanged;
 
@@ -124,8 +160,12 @@ public class ThirdPersonView : MonoBehaviour
 
         _rig = new CameraRig();
 
+        _bodyBobWeight = Mathf.Clamp01(Plugin.BodyBob.Value);
+
         // What bullets can hit, other characters' hit colliders included, so aiming at someone converges on them
         _aimSolver = new AimSolver(BallisticsCalculatorConstants.HitMask.value);
+
+        _gaitPoser = new GaitPoser(Plugin.GaitWeight.Value);
     }
 
     public void OnDestroy()
@@ -133,7 +173,97 @@ public class ThirdPersonView : MonoBehaviour
         Plugin.AdsModeOptic.SettingChanged -= _adsModeOpticChanged;
         Plugin.AdsModeBasic.SettingChanged -= _adsModeBasicChanged;
 
+        // Before the game's OnDead/Dispose (both destroy this immediately), so the body goes to ragdoll unmodified
+        _gaitPoser?.Dispose();
+
         _rig?.Destroy();
+    }
+
+    /// <summary>
+    ///     Puts back the bones the gait weight moved last frame. Script Updates run before the animator's pass for the
+    ///     local player (body update mode Auto on the Update queue, animator update mode Normal), which then poses the body
+    ///     from the clean pose; a bone the clips do not key would otherwise carry the offset into the next frame.
+    /// </summary>
+    public void Update()
+    {
+        _gaitPoser?.Restore();
+    }
+
+    /// <summary>
+    ///     From the Player.FBBIKUpdate postfix, once per frame on VisualPass's full path: after the full body IK, before the
+    ///     hands are placed at the ribcage.
+    /// </summary>
+    public void OnBodyIkSolved()
+    {
+        if (localPlayer == null || _gaitPoser == null)
+            return;
+
+        var movementContext = localPlayer.MovementContext;
+        if (movementContext == null)
+            return;
+
+        // Immediately: the 1st person camera rides the same bones
+        if (!IsViewThirdPerson)
+        {
+            _gaitPoser.Hold(movementContext, "1st person");
+            return;
+        }
+
+        // The restore in Update is only ahead of the animator when the animator runs in Unity's own animation pass
+        if (localPlayer.BodyUpdateMode != Player.EUpdateMode.Auto || localPlayer.UpdateQueue != EUpdateQueue.Update)
+        {
+            _gaitPoser.Hold(movementContext, "Animator timing");
+            return;
+        }
+
+        // Neither reaches the full path (VisualPass returns early, or takes the reduced path), checked for completeness
+        if (localPlayer.CustomAnimationsAreProcessing || localPlayer.UsedSimplifiedSkeleton)
+        {
+            _gaitPoser.Hold(movementContext, "Custom animation");
+            return;
+        }
+
+        string fadeReason = null;
+        if (IsBodyPosedByGame)
+            fadeReason = "Posed by game";
+        else if (IsProneOrTransitioning(movementContext))
+            fadeReason = "Prone";
+        else if (IsGaitBlockedState(movementContext))
+            fadeReason = "Vault/climb";
+        else if (movementContext.PlayerAnimator != null && movementContext.PlayerAnimator.AnimatedInteractions is { IsInteractionPlaying: true })
+            fadeReason = "Interaction";
+
+        var pwa = localPlayer.ProceduralWeaponAnimation;
+        var scale = pwa != null && pwa.IsAiming ? GaitPoser.AimingScale : 1f;
+        scale *= Mathf.Lerp(GaitPoser.FullCrouchScale, 1f, Mathf.Clamp01(movementContext.SmoothedPoseLevel));
+
+        _gaitPoser.Apply(localPlayer, fadeReason, scale, Plugin.GaitWeight.Value);
+    }
+
+    /// <summary>
+    ///     States whose animation moves the whole body on its own (vaults and climbs, door kicks). The vault and climb states
+    ///     only swap the rotation function (IsBodyPosedByGame) above their hands-free height, so the low ones need this.
+    /// </summary>
+    private static bool IsGaitBlockedState(MovementContext movementContext)
+    {
+        var state = movementContext.CurrentState;
+        if (state == null)
+            return false;
+
+        if (state is VaultingMovementState)
+            return true;
+
+        switch (state.Name)
+        {
+            case EPlayerState.ClimbOver:
+            case EPlayerState.ClimbUp:
+            case EPlayerState.VaultingFallDown:
+            case EPlayerState.VaultingLanding:
+            case EPlayerState.BreachDoor:
+                return true;
+            default:
+                return false;
+        }
     }
 
     private void HandleInputs()
@@ -208,6 +338,21 @@ public class ThirdPersonView : MonoBehaviour
 
         if (localPlayer.CameraPosition == null || !localPlayer.HealthController.IsAlive)
             return;
+
+        // Before the 1st person early returns: it is the same body in either view
+        UpdateTorsoDeadzone();
+
+        // Before the early returns too, so an orbit is dropped on any frame that is not 3rd person
+        UpdateOrbit();
+
+        // Every frame, 1st person included (where it snaps), so 3rd person always starts with the pivot on the eye.
+        // Before anything this frame reads the pivot: CaptureGameRotation's seed, the pivot placement.
+        var eyeTransform = localPlayer.CameraPosition.parent;
+        if (eyeTransform != null)
+        {
+            LogEyeChainOnce(eyeTransform);
+            UpdatePivotFilter(eyeTransform);
+        }
 
         // Keeps the capture edge current on the frames that return before HandleThirdPerson (1st person, stationary weapons)
         if (!IsCapturingLook)
@@ -357,6 +502,56 @@ public class ThirdPersonView : MonoBehaviour
         HandleThirdPerson();
     }
 
+    /// <summary>
+    ///     Writes the trunk rotation limit every frame, which also re-applies it after anything the game reset it for.
+    ///     It is consumed by the next animator pass. Prone is left alone: it uses its own limit (25, set and reset by the
+    ///     prone transitions) and clamps the look yaw to the body ± 35, so a larger limit would stop it turning at all.
+    /// </summary>
+    private void UpdateTorsoDeadzone()
+    {
+        var movementContext = localPlayer.MovementContext;
+        if (movementContext == null)
+            return;
+
+        _torsoProneHold = IsProneOrTransitioning(movementContext);
+        if (_torsoProneHold)
+        {
+            _torsoDeadzone.Abort();
+            return;
+        }
+
+        localPlayer.TrunkRotationLimit = _torsoDeadzone.Update(
+            movementContext.HandsToBodyAngle, Plugin.TorsoAimDeadzone.Value, Plugin.BodyTurnSpeed.Value, Time.deltaTime
+        );
+    }
+
+    /// <summary>
+    ///     IsInPronePose is the pose flag, set and cleared when prone or standing is requested, so it also covers states
+    ///     entered while lying down. The state names cover what it misses: the prone states until the state machine catches
+    ///     up with a stand request, and Prone2Stand, which runs on the prone limit until its Exit resets it.
+    /// </summary>
+    private static bool IsProneOrTransitioning(MovementContext movementContext)
+    {
+        if (movementContext.IsInPronePose)
+            return true;
+
+        var state = movementContext.CurrentState;
+        if (state == null)
+            return false;
+
+        switch (state.Name)
+        {
+            case EPlayerState.ProneIdle:
+            case EPlayerState.ProneMove:
+            case EPlayerState.Transit2Prone:
+            case EPlayerState.Prone2Stand:
+            case EPlayerState.Roll:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private void HandleThirdPerson()
     {
         if (localPlayer.PointOfView != EPointOfView.ThirdPerson)
@@ -405,9 +600,10 @@ public class ThirdPersonView : MonoBehaviour
             CloseConvergenceHold();
         }
 
-        // Same origin as Cam's parent, so _currentOffset keeps its meaning across the 1st <-> 3rd person switch
-        var eye = eyeTransform.position;
-        _rig.UpdatePivot(eye);
+        // On Cam's parent when 3rd person starts (the filter is snapped in 1st person), so _currentOffset keeps its
+        // meaning across the 1st <-> 3rd person switch
+        var pivot = GetPivotPosition(eyeTransform);
+        _rig.UpdatePivot(pivot);
         _pivotPlaced = true;
 
         // After CaptureGameRotation, so a seed made this frame already holds this frame's offset step
@@ -420,29 +616,240 @@ public class ThirdPersonView : MonoBehaviour
         {
             // Where the centre ray points now, from the current rig rotation, so mouse input in the window still aims
             var rigRotation = _rig.Rotation;
-            heldPoint = eye + rigRotation * _currentOffset + rigRotation * Vector3.forward * _aimSolver.SmoothedDistance;
+            heldPoint = pivot + rigRotation * _aimOffset + rigRotation * Vector3.forward * _aimSolver.SmoothedDistance;
         }
 
-        // Cast origin is offset in world space, so it stays above the eye regardless of pitch
+        // Cast origin is offset in world space, so it stays above the pivot regardless of pitch
         var eyeCameraPos = _rig.Pivot.position + _eyeCameraOffset;
 
         _currentOffset = _positionSolver.Solve(
             _rig.Pivot, _currentOffset, desiredCameraOffset, eyeCameraPos, _eyeCameraHitMask
         );
 
+        // Between the held point and the re-point, so the hold cancels exactly the aim camera's translation
+        UpdateAimOffset();
+
         if (holding)
         {
             // Cancel the aim shift of the camera translating: same point under the centre from the new position
-            _aimSolver.SnapDistance(PointRigAt(eye, heldPoint));
-            _rig.UpdatePivot(eye);
+            _aimSolver.SnapDistance(PointRigAt(pivot, heldPoint));
+            _rig.UpdatePivot(pivot);
 
-            if ((_currentOffset - desiredCameraOffset).sqrMagnitude < ConvergenceHoldSettledSqr)
+            if ((_aimOffset - desiredCameraOffset).sqrMagnitude < ConvergenceHoldSettledSqr)
                 CloseConvergenceHold();
         }
 
         // Written in world space: Cam's parent is re-rotated by the game every frame, the rig is what we aim with.
         // The game copies Cam onto the real camera right after this, in the same PlayerCameraController.LateUpdate.
-        localPlayer.CameraPosition.SetPositionAndRotation(_rig.Pivot.TransformPoint(_currentOffset), _rig.Rotation);
+        // The view rotation: the pivot already carries it, the free look orbit included.
+        localPlayer.CameraPosition.SetPositionAndRotation(_rig.Pivot.TransformPoint(_currentOffset), _rig.ViewRotation);
+    }
+
+    /// <summary>
+    ///     Exactly _currentOffset without an orbit. Frozen while the rig has one; afterwards eased back at a bounded speed,
+    ///     then exact again once it has caught up.
+    /// </summary>
+    private void UpdateAimOffset()
+    {
+        if (_rig.HasOrbit)
+        {
+            _aimOffsetDetached = true;
+            return;
+        }
+
+        if (_aimOffsetDetached)
+        {
+            var step = AimOffsetCatchUpSpeed * Time.deltaTime;
+            if ((_currentOffset - _aimOffset).sqrMagnitude > step * step)
+            {
+                _aimOffset = Vector3.MoveTowards(_aimOffset, _currentOffset, step);
+                return;
+            }
+
+            _aimOffsetDetached = false;
+        }
+
+        _aimOffset = _currentOffset;
+    }
+
+    /// <summary>
+    ///     The camera pivot: the eye moved by Body Bob's share of the difference between its filtered and raw offsets from
+    ///     the body. That is anchor + yaw * Lerp(raw, filtered, weight), with the anchor moving 1:1 with the character so
+    ///     only the body-relative bob is smoothed, never the travel. Everything but the filtered offset is read live, so
+    ///     the aim solve in Update sees this frame's root motion. Exactly the eye at weight 0 and while bypassed.
+    /// </summary>
+    private Vector3 GetPivotPosition(Transform eyeTransform)
+    {
+        var eye = eyeTransform.position;
+
+        if (!(_bodyBobWeight > 0f) || IsPivotFilterBypassed || !TryGetPivotFrame(eye, out var yaw, out var raw))
+            return eye;
+
+        var pivot = eye + yaw * ((_pivotFilter.Offset - raw) * _bodyBobWeight);
+        return ClampPivotToEye(eye, pivot);
+    }
+
+    /// <summary>
+    ///     The game keeps the real eye out of geometry, a pivot that lags it is not: pull it back to just short of anything
+    ///     between the two, with the mask the camera solver uses for its own origin.
+    /// </summary>
+    private Vector3 ClampPivotToEye(Vector3 eye, Vector3 pivot)
+    {
+        var delta = pivot - eye;
+        var sqrDistance = delta.sqrMagnitude;
+        if (!(sqrDistance > PivotMinCastSqr))
+            return pivot;
+
+        var distance = Mathf.Sqrt(sqrDistance);
+        var direction = delta / distance;
+
+        if (Physics.Raycast(eye, direction, out var hit, distance + PivotCollisionSkin, _eyeCameraHitMask, QueryTriggerInteraction.Ignore))
+            return eye + direction * Mathf.Max(0f, Mathf.Min(distance, hit.distance - PivotCollisionSkin));
+
+        return pivot;
+    }
+
+    /// <summary>
+    ///     The eye's offset from the anchor in the body's yaw frame. The anchor is the animated model root: it moves with
+    ///     the character (its height smoothed over steps by Player.HeightInterpolation) but not with the gait. The yaw is
+    ///     the body root's, which MovementContext.ApplyRotation turns, so turning the character is not an offset change.
+    /// </summary>
+    private bool TryGetPivotFrame(Vector3 eye, out Quaternion yaw, out Vector3 rawOffset)
+    {
+        yaw = Quaternion.identity;
+        rawOffset = default;
+
+        var bones = localPlayer.PlayerBones;
+        var body = bones != null ? bones.BodyTransform?.Original : null;
+        if (body == null)
+            return false;
+
+        var animated = bones.AnimatedTransform?.Original;
+        var anchor = animated != null ? animated.position : body.position;
+
+        // From the forward vector, as CameraRig.SyncFrom: only the heading, whatever the body's pitch (prone on a slope)
+        var forward = body.rotation * Vector3.forward;
+        if (forward.x * forward.x + forward.z * forward.z > PivotMinCastSqr)
+            _lastBodyYaw = Quaternion.Euler(0f, Mathf.Atan2(forward.x, forward.z) * Mathf.Rad2Deg, 0f);
+
+        yaw = _lastBodyYaw;
+        rawOffset = Quaternion.Inverse(yaw) * (eye - anchor);
+
+        return !float.IsNaN(rawOffset.x) && !float.IsNaN(rawOffset.y) && !float.IsNaN(rawOffset.z)
+               && !float.IsInfinity(rawOffset.x) && !float.IsInfinity(rawOffset.y) && !float.IsInfinity(rawOffset.z);
+    }
+
+    /// <summary>
+    ///     Pivot on the eye: in 1st person (3rd person relies on starting there) and while the game poses the body itself
+    ///     (vault and climb, mounting, stationary weapons, vehicles), which a slow filter should not chase.
+    /// </summary>
+    private bool IsPivotFilterBypassed => !IsViewThirdPerson || IsBodyPosedByGame;
+
+    /// <summary>
+    ///     Once per LateUpdate, before anything reads the pivot.
+    /// </summary>
+    private void UpdatePivotFilter(Transform eyeTransform)
+    {
+        var deltaTime = Time.deltaTime;
+        _bodyBobWeight = Mathf.MoveTowards(_bodyBobWeight, Mathf.Clamp01(Plugin.BodyBob.Value), BodyBobWeightRate * deltaTime);
+
+        if (!TryGetPivotFrame(eyeTransform.position, out _, out var raw))
+        {
+            _pivotFilter.Reset();
+            return;
+        }
+
+        _pivotRawOffset = raw;
+
+        if (IsPivotFilterBypassed)
+            _pivotFilter.Snap(raw);
+        else
+            _pivotFilter.Step(raw, deltaTime);
+    }
+
+    /// <summary>
+    ///     Which bone the camera container rides on, from Cam's parent up to the player. Once per raid, with logging on.
+    /// </summary>
+    private void LogEyeChainOnce(Transform eyeTransform)
+    {
+        if (_eyeChainLogged || !Plugin.LoggingEnabled)
+            return;
+
+        _eyeChainLogged = true;
+
+        var bones = localPlayer.PlayerBones;
+        var animated = bones != null ? bones.AnimatedTransform?.Original : null;
+        var body = bones != null ? bones.BodyTransform?.Original : null;
+        var chain = new System.Text.StringBuilder();
+        for (var t = eyeTransform; t != null; t = t.parent)
+        {
+            if (chain.Length > 0)
+                chain.Append(" -> ");
+
+            chain.Append(t.name);
+            if (t == animated) chain.Append(" [AnimatedTransform]");
+            if (t == body) chain.Append(" [BodyTransform]");
+
+            // Player.Transform; without it, up to the scene root
+            if (t == body)
+                break;
+        }
+
+        Plugin.Log.LogInfo($"Camera container chain: {chain}");
+    }
+
+    /// <summary>
+    ///     Whether the free look key orbits the camera: only while the view really is 3rd person. PlayerBody's value, as
+    ///     in IsCapturingLook, because Player.PointOfView is faked as 1st person during VisualPass.
+    /// </summary>
+    private bool IsOrbitAllowed => Plugin.FreeLookOrbitEnabled.Value && localPlayer.PlayerBody.PointOfView.Value == EPointOfView.ThirdPerson;
+
+    /// <summary>
+    ///     Called from the MoveInputTranslator.TranslateAxes prefix (Update) with the look axes as TranslateAxes hands
+    ///     them to Player.Look. They are only non-zero while the free look key is held. Read only: the game's own Look
+    ///     still turns the head with them.
+    /// </summary>
+    public void OnFreeLookInput(Vector2 rawDelta)
+    {
+        if ((rawDelta.x == 0f && rawDelta.y == 0f) || !CameraRig.IsFinite(rawDelta) || !IsOrbitAllowed)
+            return;
+
+        _orbitHeld = true;
+
+        var state = localPlayer.CurrentManagedState;
+        if (state == null)
+            return;
+
+        // Scaled like normal mouse look (OnLookInput) rather than raw like Look's head turn, so the orbit has the
+        // player's sensitivity. The look and turn axes have the same bindings, so the signs match normal look too.
+        Vector2 scaledDelta = state.ClampRotation(rawDelta);
+        _rig.AddOrbit(scaledDelta.x, scaledDelta.y, Plugin.FreeLookMaxAngle.Value);
+    }
+
+    /// <summary>
+    ///     Called from the Player.ResetLookDirection postfix: the free look key was released (or a cutscene reset the
+    ///     look), the orbit returns from here on.
+    /// </summary>
+    public void OnFreeLookReset()
+    {
+        _orbitHeld = false;
+    }
+
+    private void UpdateOrbit()
+    {
+        if (!IsOrbitAllowed)
+        {
+            // 1st person (ADS included) keeps the game's native free look; a leftover orbit must not reappear later
+            _orbitHeld = false;
+            _rig.ClearOrbit();
+            return;
+        }
+
+        if (!_orbitHeld)
+            _rig.DecayOrbit(OrbitReturnRate, Time.deltaTime);
+
+        // Every frame: the max angle is live and the aim pitch the pitch limit depends on moves
+        _rig.ClampOrbit(Plugin.FreeLookMaxAngle.Value);
     }
 
     /// <summary>
@@ -463,21 +870,30 @@ public class ThirdPersonView : MonoBehaviour
     {
         get
         {
-            if (!Plugin.FreeAimCameraEnabled.Value)
-                return false;
+            return Plugin.FreeAimCameraEnabled.Value && IsViewThirdPerson && !IsBodyPosedByGame;
+        }
+    }
 
+    /// <summary>
+    ///     PlayerBody's value rather than Player.PointOfView, which our PoV override fakes as 1st person during VisualPass.
+    ///     1st person ADS, the 3rd person toggle being off and stationary weapons all end up in 1st person here.
+    /// </summary>
+    private bool IsViewThirdPerson => localPlayer.PlayerBody.PointOfView.Value == EPointOfView.ThirdPerson;
+
+    /// <summary>
+    ///     The rotation function check covers the states that pose Cam's parent from something other than HandsRotation
+    ///     (high vault/climb, stationary, mounted, cutscenes). The mounting approach and the BTR keep the default function
+    ///     (the BTR swaps HandsRotation's source instead), hence the explicit checks for those.
+    /// </summary>
+    private bool IsBodyPosedByGame
+    {
+        get
+        {
             var movementContext = localPlayer.MovementContext;
-
-            // PlayerBody's value rather than Player.PointOfView, which our PoV override fakes as 1st person during VisualPass.
-            // 1st person ADS, the 3rd person toggle being off and stationary weapons all end up in 1st person here.
-            // The rotation function check covers the states that pose Cam's parent from something other than HandsRotation
-            // (high vault/climb, stationary, mounted, cutscenes). The mounting approach and the BTR keep the default function
-            // (the BTR swaps HandsRotation's source instead), hence the explicit checks for those.
-            return localPlayer.PlayerBody.PointOfView.Value == EPointOfView.ThirdPerson
-                   && movementContext.RotationAction == MovementContext.DefaultRotationFunction
-                   && !movementContext.IsInMountedState
-                   && movementContext.StationaryWeapon == null
-                   && localPlayer.BtrState == EPlayerBtrState.Outside;
+            return movementContext.RotationAction != MovementContext.DefaultRotationFunction
+                   || movementContext.IsInMountedState
+                   || movementContext.StationaryWeapon != null
+                   || localPlayer.BtrState != EPlayerBtrState.Outside;
         }
     }
 
@@ -562,7 +978,7 @@ public class ThirdPersonView : MonoBehaviour
     {
         desired = default;
 
-        if (!TryGetConvergenceInputs(out var ribcage, out var muzzleOffset, out var eye))
+        if (!TryGetConvergenceInputs(out var ribcage, out var muzzleOffset, out var pivot))
         {
             _convergenceActive = false;
             CloseConvergenceHold();
@@ -575,7 +991,7 @@ public class ThirdPersonView : MonoBehaviour
 
         // The rig's current rotation, so this frame's mouse turn already orbits the camera
         var rigRotation = _rig.Rotation;
-        var cameraPosition = eye + rigRotation * _currentOffset;
+        var cameraPosition = pivot + rigRotation * _aimOffset;
         var cameraForward = rigRotation * Vector3.forward;
         var aimOrigin = ribcage + Quaternion.Euler(current.y, current.x, 0f) * muzzleOffset;
 
@@ -599,11 +1015,12 @@ public class ThirdPersonView : MonoBehaviour
 
     /// <summary>
     ///     Everything the convergence model needs, or false (with the reason recorded for the debug UI) to aim parallel.
-    ///     The eye is where the pivot is placed each LateUpdate; read live so it is not stale after a spell in 1st person.
+    ///     The pivot is the one the camera is placed at each LateUpdate; read live so it is not stale after a spell in 1st
+    ///     person and carries this frame's root motion when called from Update.
     /// </summary>
-    private bool TryGetConvergenceInputs(out Vector3 ribcage, out Vector3 muzzleOffset, out Vector3 eye)
+    private bool TryGetConvergenceInputs(out Vector3 ribcage, out Vector3 muzzleOffset, out Vector3 pivot)
     {
-        ribcage = muzzleOffset = eye = default;
+        ribcage = muzzleOffset = pivot = default;
 
         if (!Plugin.AimConvergenceEnabled.Value)
         {
@@ -629,7 +1046,7 @@ public class ThirdPersonView : MonoBehaviour
         ribcage = ribcageBone.Original.position;
         // Low-passed every LateUpdate, toward zero without a firearm, so it is valid whatever is in hands
         muzzleOffset = _aimSolver.MuzzleOffset;
-        eye = eyeTransform.position;
+        pivot = GetPivotPosition(eyeTransform);
 
         // Read live: this runs in Update, possibly right after a weapon swap
         RefreshAimIgnores();
@@ -689,7 +1106,7 @@ public class ThirdPersonView : MonoBehaviour
     /// </summary>
     private bool SeedRigForConvergence(Vector2 playerRotation)
     {
-        if (!TryGetConvergenceInputs(out var ribcage, out var muzzleOffset, out var eye))
+        if (!TryGetConvergenceInputs(out var ribcage, out var muzzleOffset, out var pivot))
         {
             _convergenceActive = false;
             CloseConvergenceHold();
@@ -702,7 +1119,7 @@ public class ThirdPersonView : MonoBehaviour
 
         // Iterate from the player's rotation
         _rig.SetAngles(playerRotation.x, playerRotation.y);
-        _aimSolver.SnapDistance(PointRigAt(eye, target));
+        _aimSolver.SnapDistance(PointRigAt(pivot, target));
         _convergenceActive = true;
         _convergenceFallback = null;
 
@@ -713,22 +1130,22 @@ public class ThirdPersonView : MonoBehaviour
     }
 
     /// <summary>
-    ///     Turns the rig, from its current rotation, so the centre ray from eye + rotation * _currentOffset passes through
+    ///     Turns the rig, from its current rotation, so the centre ray from pivot + rotation * _aimOffset passes through
     ///     target, and returns target's distance along that ray. The camera position depends on the rotation, hence the
     ///     iteration; it contracts by about |offset| / distance per step.
     /// </summary>
-    private float PointRigAt(Vector3 eye, Vector3 target)
+    private float PointRigAt(Vector3 pivot, Vector3 target)
     {
         for (var i = 0; i < 2; i++)
         {
-            if (!AimSolver.TryYawPitch(target - (eye + _rig.Rotation * _currentOffset), _rig.Yaw, out var rigAngles))
+            if (!AimSolver.TryYawPitch(target - (pivot + _rig.Rotation * _aimOffset), _rig.Yaw, out var rigAngles))
                 break;
 
             _rig.SetAngles(rigAngles.x, rigAngles.y);
         }
 
         var rigRotation = _rig.Rotation;
-        return Vector3.Dot(target - (eye + rigRotation * _currentOffset), rigRotation * Vector3.forward);
+        return Vector3.Dot(target - (pivot + rigRotation * _aimOffset), rigRotation * Vector3.forward);
     }
 
     private bool IsConvergenceHoldOpen => Time.time < _convergenceHoldUntil;
@@ -792,6 +1209,9 @@ public class ThirdPersonView : MonoBehaviour
             localPlayer.POM.CameraCollider.enabled = true;
             // Reset the offset back to the BSG default
             localPlayer.CameraPosition.localPosition = _currentOffset = localPlayer.ProceduralWeaponAnimation.HandsContainer.CameraOffset;
+            // The seed on the way back to 3rd person models the camera from here too, any orbit is gone in 1st person
+            _aimOffset = _currentOffset;
+            _aimOffsetDetached = false;
             // Drop the rotation the rig wrote in 3rd person. PWA.LerpCamera rewrites it every 1st person frame, this
             // only covers the frame of the switch. Its neutral value is prefab data, hence restoring rather than assuming.
             localPlayer.CameraPosition.localRotation = _fpCamLocalRotation;
@@ -887,7 +1307,11 @@ public class ThirdPersonView : MonoBehaviour
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Near Clip Plane: {(gameCamera != null ? gameCamera.nearClipPlane.ToString() : "-")}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Line Scan Radius P1: {_positionSolver.Phase1.LineScanRadius} P2: {_positionSolver.Phase2.LineScanRadius} P3: {_positionSolver.Phase3.LineScanRadius}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Player Velocity: {localPlayer.Velocity} Motion: {localPlayer.Motion} Rot: {localPlayer.MovementContext.Rotation}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Hands To Body: {localPlayer.MovementContext.HandsToBodyAngle:F2} Trunk Limit: {localPlayer.TrunkRotationLimit:F2} Turning: {_torsoDeadzone.IsTurning} Prone Hold: {_torsoProneHold}", centered: false);
+            var gait = _gaitPoser.Gait;
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Gait: Feet Sep: {_gaitPoser.FootSeparation:F2} Move W: {_gaitPoser.MovementWeight:F2}{(_gaitPoser.Airborne ? " (air)" : "")} Master: {_gaitPoser.Master:F2}{(_gaitPoser.Suppression != null ? " (" + _gaitPoser.Suppression + ")" : "")} Intensity: {_gaitPoser.Intensity:F2} | Dip Target: {gait.DipTarget * 100f:F2}cm Dip: {gait.Dip * 100f:F2}cm Sway: {gait.Sway * 100f:F2}cm Sag: {gait.Sag:F2} Head: {gait.Head:F2}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Free Aim: {Plugin.FreeAimCameraEnabled.Value} Capturing: {IsCapturingLook} Default RotAction: {localPlayer.MovementContext.RotationAction == MovementContext.DefaultRotationFunction} BTR: {localPlayer.BtrState}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Free Look Orbit: {Plugin.FreeLookOrbitEnabled.Value} Held: {_orbitHeld} Offset Yaw: {_rig.OrbitYaw:F2} Pitch: {_rig.OrbitPitch:F2} | Game MouseLookControl: {localPlayer.MouseLookControl} Resetting: {localPlayer.IsResettingLook} Head: {localPlayer.HeadRotation.ToString("F1")}", centered: false);
             var playerRotation = localPlayer.MovementContext.Rotation;
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Rig Yaw: {_rig.Yaw:F2} Pitch: {_rig.Pitch:F2} | Player Yaw: {playerRotation.x:F2} Pitch: {playerRotation.y:F2} | Rig - Player: {CameraRig.AngleDelta(playerRotation, _rig.Angles).ToString("F3")}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Last Reconcile Shortfall: {_lastReconcileShortfall.ToString("F3")} Eye Scale: {(eyeTransform != null ? eyeTransform.lossyScale.ToString("F3") : "-")}", centered: false);
@@ -899,7 +1323,9 @@ public class ThirdPersonView : MonoBehaviour
             if (_convergenceActive && _firearmController != null && _firearmController.CurrentFireport?.Original != null)
                 missAngle = Vector3.Angle(_firearmController.WeaponDirection, _aimSolver.AimPoint - _firearmController.CurrentFireport.position).ToString("F3");
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Muzzle Offset: {_aimSolver.MuzzleOffset.ToString("F3")} Miss Angle: {missAngle}", centered: false);
-            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Offset: {_currentOffset} PWA Offset: {pwa.HandsContainer.CameraOffset}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Offset: {_currentOffset} Aim Offset: {_aimOffset}{(_aimOffsetDetached ? " (detached)" : "")} PWA Offset: {pwa.HandsContainer.CameraOffset}", centered: false);
+            var pivotFiltered = _pivotFilter.Offset;
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Pivot Offset Raw: {_pivotRawOffset.ToString("F3")} Filtered: {pivotFiltered.ToString("F3")} Bob Shown: {((_pivotRawOffset - pivotFiltered) * _bodyBobWeight).ToString("F3")} Weight: {_bodyBobWeight:F2} Bypassed: {_pivotFilter.Bypassed}", centered: false);
             if (camTransform != null)
             {
                 rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Pos: {camTransform.position} Local: {camTransform.localPosition}", centered: false);

@@ -23,6 +23,20 @@ public static class PlayerPoVFuckery
     public static bool OverridePoV;
 }
 
+/*
+ * Where the gait weight (GaitPoser) goes on the skeleton: on VisualPass's full path, right after FBBIKUpdate and before the
+ * MouseLook call that places the hands object at the ribcage. Only the full path calls FBBIKUpdate, immediately before
+ * that MouseLook, so the end of a FBBIKUpdate inside the local player's VisualPass is exactly that point.
+ *
+ * Hooked on FBBIKUpdate rather than MouseLook because MouseLook is virtual and Fika's FikaPlayer (the local player's class
+ * when Fika is installed) overrides it without calling the base, so a patch on Player.MouseLook never runs there.
+ */
+public static class LocalVisualPass
+{
+    // The local player's VisualPass is running. Separate from OverridePoV, which is skipped while mounted.
+    public static bool Running;
+}
+
 public class PlayerPointOfViewPrefixPatch : ModulePatch
 {
     protected override MethodBase GetTargetMethod()
@@ -54,7 +68,12 @@ public class PlayerVisualPassPatch : ModulePatch
     {
         var localPlayer = Singleton<GameWorld>.Instance.MainPlayer;
 
-        if (__instance != localPlayer || localPlayer.ProceduralWeaponAnimation.IsMountedState)
+        if (__instance != localPlayer)
+            return;
+
+        LocalVisualPass.Running = true;
+
+        if (localPlayer.ProceduralWeaponAnimation.IsMountedState)
             return;
 
         PlayerPoVFuckery.OverridePoV = true;
@@ -68,6 +87,28 @@ public class PlayerVisualPassPatch : ModulePatch
             return;
 
         PlayerPoVFuckery.OverridePoV = false;
+        LocalVisualPass.Running = false;
+    }
+}
+
+public class PlayerFBBIKUpdatePostfixPatch : ModulePatch
+{
+    protected override MethodBase GetTargetMethod()
+    {
+        return typeof(Player).GetMethod(nameof(Player.FBBIKUpdate));
+    }
+
+    [PatchPostfix]
+    // ReSharper disable once InconsistentNaming
+    public static void Postfix(Player __instance)
+    {
+        // The static first: this runs for every player and bot
+        if (!LocalVisualPass.Running || __instance != Singleton<GameWorld>.Instance.MainPlayer)
+            return;
+
+        var view = Singleton<ThirdPersonView>.Instance;
+        if (view != null)
+            view.OnBodyIkSolved();
     }
 }
 

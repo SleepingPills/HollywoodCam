@@ -1,6 +1,7 @@
 using System.Reflection;
 using Comfort.Common;
 using EFT;
+using EFT.InputSystem;
 using SPT.Reflection.Patching;
 using UnityEngine;
 
@@ -12,6 +13,11 @@ namespace HollywoodCam.Patches;
  * The delta is substituted inside the game's own mouse look Player.Rotate call rather than calling Rotate a second time:
  * a second call per frame would reset PreviousRotation and skew the rotation speed tracking that feeds sprint speed and
  * turn sounds.
+ *
+ * Free look orbit: while the game's free look key is held the mouse feeds the look axes instead of the turn axes, and
+ * TranslateAxes hands those to Player.Look (the head). The same values orbit the camera (ThirdPersonView.OnFreeLookInput).
+ * Releasing the key sends ECommand.ResetLookDirection, which ends up in Player.ResetLookDirection; that is where the
+ * orbit is let go to return.
  */
 public static class LookInput
 {
@@ -35,10 +41,17 @@ public class MoveInputTranslatorTranslateAxesPatch : ModulePatch
 
     [PatchPrefix]
     // ReSharper disable once InconsistentNaming
-    public static void Prefix(MoveInputTranslator __instance)
+    public static void Prefix(MoveInputTranslator __instance, ref float[] axes)
     {
         var view = Singleton<ThirdPersonView>.Instance;
         LookInput.LocalDispatch = view != null && __instance._controller == view.localPlayer;
+
+        if (!LookInput.LocalDispatch || axes == null || axes.Length <= (int)EAxis.LookY)
+            return;
+
+        // Free look orbit. Signed exactly as TranslateAxes passes them to Player.Look (and the turn axes to Rotate), and
+        // left in place: Look runs before the IsAxesIgnored check and keeps turning the head.
+        view.OnFreeLookInput(new Vector2(__instance._xDirection * axes[(int)EAxis.LookX], __instance._yDirection * axes[(int)EAxis.LookY]));
     }
 
     [PatchFinalizer]
@@ -48,6 +61,25 @@ public class MoveInputTranslatorTranslateAxesPatch : ModulePatch
         LookInput.LocalDispatch = false;
         LookInput.Substituted = false;
         LookInput.RestoreLastMovement = float.NaN;
+    }
+}
+
+public class PlayerResetLookDirectionPatch : ModulePatch
+{
+    protected override MethodBase GetTargetMethod()
+    {
+        return typeof(Player).GetMethod(nameof(Player.ResetLookDirection));
+    }
+
+    [PatchPostfix]
+    // ReSharper disable once InconsistentNaming
+    public static void Postfix(Player __instance)
+    {
+        var view = Singleton<ThirdPersonView>.Instance;
+        if (view == null || __instance != view.localPlayer)
+            return;
+
+        view.OnFreeLookReset();
     }
 }
 

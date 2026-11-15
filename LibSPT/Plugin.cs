@@ -57,10 +57,13 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<Vector3> CameraGrenadeOffset;
     public static ConfigEntry<KeyCode> CameraShoulderKey;
     public static ConfigEntry<float> CameraMoveSpeed;
+    public static ConfigEntry<float> BodyBob;
     public static ConfigEntry<bool> FreeAimCameraEnabled;
     public static ConfigEntry<bool> AimConvergenceEnabled;
     public static ConfigEntry<float> AimConvergenceMinDistance;
     public static ConfigEntry<float> AimConvergenceSpeed;
+    public static ConfigEntry<bool> FreeLookOrbitEnabled;
+    public static ConfigEntry<float> FreeLookMaxAngle;
 
     public static ConfigEntry<AdsModeEnum> AdsModeOptic;
     public static ConfigEntry<AdsModeEnum> AdsModeBasic;
@@ -88,7 +91,9 @@ public class Plugin : BaseUnityPlugin
 
     public static ConfigEntry<float> InteractionRayRadius;
     public static ConfigEntry<float> FlinchScale;
-    public static ConfigEntry<bool> ShimmyEnabled;
+    public static ConfigEntry<float> TorsoAimDeadzone;
+    public static ConfigEntry<float> BodyTurnSpeed;
+    public static ConfigEntry<float> GaitWeight;
     public static ConfigEntry<float> InteractionRange;
     
     public static ConfigEntry<bool> DebugUIEnabled;
@@ -117,10 +122,15 @@ public class Plugin : BaseUnityPlugin
         new PlayerVisualPassPatch().Enable();
         new PlayerCameraControllerLateUpdatePrefixPatch().Enable();
         new ProceduralWeaponAnimationSetStrategyPrefixPatch().Enable();
+        new PlayerFBBIKUpdatePostfixPatch().Enable();
 
         // Look
         new MoveInputTranslatorTranslateAxesPatch().Enable();
         new PlayerRotatePatch().Enable();
+        new PlayerResetLookDirectionPatch().Enable();
+
+        // Movement
+        new SideStepPlayerStateEnterPrefixPatch().Enable();
 
         // Player
         new PlayerConstructorPostfixPatch().Enable();
@@ -239,23 +249,33 @@ public class Plugin : BaseUnityPlugin
         FreeAimCameraEnabled = Config.Bind(headerCamera, "Free Aim Camera", true, new ConfigDescription(
             "In third person the camera owns the look direction and the character turns to aim where the camera aims. " +
             "Turn this off to restore the camera rigidly following the character.",
-            tags: new ConfigurationManagerAttributes { Order = 10 }
+            tags: new ConfigurationManagerAttributes { Order = 12 }
         ));
         AimConvergenceEnabled = Config.Bind(headerCamera, "Aim Convergence", true, new ConfigDescription(
             "The character aims at the point under the centre of the screen instead of parallel to the camera. " +
             "Only applies while Free Aim Camera is on.",
-            tags: new ConfigurationManagerAttributes { Order = 9 }
+            tags: new ConfigurationManagerAttributes { Order = 11 }
         ));
         AimConvergenceMinDistance = Config.Bind(headerCamera, "Aim Convergence Min Distance", 1f, new ConfigDescription(
             "The closest the aim point is allowed to be to the muzzle (in meters). Closer than this the weapon would swing hard " +
             "to converge, so very close shots land off-centre instead (the crosshair shows where).",
             new AcceptableValueRange<float>(0.5f, 10f),
-            tags: new ConfigurationManagerAttributes { Order = 8 }
+            tags: new ConfigurationManagerAttributes { Order = 10 }
         ));
         AimConvergenceSpeed = Config.Bind(headerCamera, "Aim Convergence Speed", 12f, new ConfigDescription(
             "How quickly the aim adapts when the distance under the centre of the screen changes, e.g. sweeping from a far wall " +
             "onto a near pillar. Higher values are snappier.",
             new AcceptableValueRange<float>(1f, 60f),
+            tags: new ConfigurationManagerAttributes { Order = 9 }
+        ));
+        FreeLookOrbitEnabled = Config.Bind(headerCamera, "Free Look Orbit", true, new ConfigDescription(
+            "Holding the game's free look key in third person orbits the camera around the character instead of only turning " +
+            "the head. The character keeps aiming where it was, and the camera swings back when the key is released.",
+            tags: new ConfigurationManagerAttributes { Order = 8 }
+        ));
+        FreeLookMaxAngle = Config.Bind(headerCamera, "Free Look Max Angle", 150f, new ConfigDescription(
+            "How far (in degrees) the free look orbit can swing the camera to either side of the aim direction.",
+            new AcceptableValueRange<float>(40f, 180f),
             tags: new ConfigurationManagerAttributes { Order = 7 }
         ));
         CameraPositionDefault = Config.Bind(headerCamera, "Default Camera Position", CameraPositionEnum.Main, new ConfigDescription(
@@ -285,6 +305,13 @@ public class Plugin : BaseUnityPlugin
             "Higher values will result in a twitchier camera.",
             new AcceptableValueRange<float>(0f, 3f),
             tags: new ConfigurationManagerAttributes { Order = 1 }
+        ));
+        BodyBob = Config.Bind(headerCamera, "Body Bob", 0.8f, new ConfigDescription(
+            "How much the character's head and shoulders are allowed to move on screen when walking and sprinting. " +
+            "0 locks the camera to the head so the head stays perfectly level (the old behaviour), 1 keeps the camera steady " +
+            "so the full motion of the animation shows.",
+            new AcceptableValueRange<float>(0f, 1f),
+            tags: new ConfigurationManagerAttributes { Order = 0 }
         ));
 
         CrosshairEnabled = Config.Bind(headerCrosshair, "Enable Crosshair", true, new ConfigDescription(
@@ -320,15 +347,33 @@ public class Plugin : BaseUnityPlugin
         InteractionRayRadius = Config.Bind(headerMisc, "Interaction Radius", 0.1f, new ConfigDescription(
             "The radius of the raycast for picking interactable objects (in meters).",
             new AcceptableValueRange<float>(0.01f, 0.1f),
-            tags: new ConfigurationManagerAttributes { Order = 4 }
+            tags: new ConfigurationManagerAttributes { Order = 6 }
         ));
         FlinchScale = Config.Bind(headerMisc, "Flinch Amount", 0.35f, new ConfigDescription(
             "How much flinch is applied when shot. A small value goes a long way. Set to 5 if you want to larp being a bobble head.",
             new AcceptableValueRange<float>(0f, 5f),
+            tags: new ConfigurationManagerAttributes { Order = 5 }
+        ));
+        TorsoAimDeadzone = Config.Bind(headerMisc, "Torso Aim Deadzone", 35f, new ConfigDescription(
+            "How far (in degrees) the character can aim with the upper body while standing still before the legs turn. " +
+            "0 makes the body always follow the aim. 45 is the game's own value and the most the animations allow: past it " +
+            "the game plays a turn-in-place animation that turns the legs regardless. Not used while prone, which keeps the " +
+            "game's own limit.",
+            // Capped at 45: the Turn_Left/Right_90_Aim animator states take over beyond it (see TorsoDeadzone)
+            new AcceptableValueRange<float>(0f, 45f),
+            tags: new ConfigurationManagerAttributes { Order = 4 }
+        ));
+        BodyTurnSpeed = Config.Bind(headerMisc, "Body Turn Speed", 240f, new ConfigDescription(
+            "How fast (in degrees per second) the legs re-orient to face the aim once it leaves the Torso Aim Deadzone. " +
+            "0 keeps the legs trailing at the edge of the deadzone instead of re-centring, which is the game's native behaviour.",
+            new AcceptableValueRange<float>(0f, 720f),
             tags: new ConfigurationManagerAttributes { Order = 3 }
         ));
-        ShimmyEnabled = Config.Bind(headerMisc, "Shimmy When Turning", true, new ConfigDescription(
-            "Toggles the feet shimmying when turning the torso. Enabled by default in Live Tarkov. Purely cosmetic.",
+        GaitWeight = Config.Bind(headerMisc, "Gait Weight", 1f, new ConfigDescription(
+            "Adds a bob and sag of the head and shoulders with each step in third person, so the character moves with weight " +
+            "instead of gliding. Bigger strides (sprinting) dip more, and landings from a jump or fall dip too. 1 is the intended " +
+            "amount, 2 doubles it. 0 turns it off.",
+            new AcceptableValueRange<float>(0f, 2f),
             tags: new ConfigurationManagerAttributes { Order = 2 }
         ));
         InteractionRange = Config.Bind(headerMisc, "3rd Person Interaction Range (RESTART)", 3.5f, new ConfigDescription(

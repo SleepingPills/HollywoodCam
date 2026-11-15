@@ -19,11 +19,7 @@ public class GameWorldStartedPostfixPatch : ModulePatch
     {
         var tpView = Singleton<ThirdPersonView>.Instance = __instance.MainPlayer.gameObject.AddComponent<ThirdPersonView>();
         tpView.localPlayer = __instance.MainPlayer;
-        
-        // Disables the jitter when rotating on the trunk
-        if (!Plugin.ShimmyEnabled.Value)
-            __instance.MainPlayer.TrunkRotationLimit = 0f;
-        
+
         Plugin.Log.LogInfo("Third Person Camera & Player Initialized");
     }
 }
