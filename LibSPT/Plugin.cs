@@ -57,6 +57,10 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<Vector3> CameraGrenadeOffset;
     public static ConfigEntry<KeyCode> CameraShoulderKey;
     public static ConfigEntry<float> CameraMoveSpeed;
+    public static ConfigEntry<bool> FreeAimCameraEnabled;
+    public static ConfigEntry<bool> AimConvergenceEnabled;
+    public static ConfigEntry<float> AimConvergenceMinDistance;
+    public static ConfigEntry<float> AimConvergenceSpeed;
 
     public static ConfigEntry<AdsModeEnum> AdsModeOptic;
     public static ConfigEntry<AdsModeEnum> AdsModeBasic;
@@ -90,6 +94,9 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<bool> DebugUIEnabled;
     private static ConfigEntry<bool> _loggingEnabled;
 
+    // For log lines that would otherwise fire per player or bot
+    public static bool LoggingEnabled => _loggingEnabled != null && _loggingEnabled.Value;
+
     private void Awake()
     {
         Log = Logger;
@@ -110,6 +117,10 @@ public class Plugin : BaseUnityPlugin
         new PlayerVisualPassPatch().Enable();
         new PlayerCameraControllerLateUpdatePrefixPatch().Enable();
         new ProceduralWeaponAnimationSetStrategyPrefixPatch().Enable();
+
+        // Look
+        new MoveInputTranslatorTranslateAxesPatch().Enable();
+        new PlayerRotatePatch().Enable();
 
         // Player
         new PlayerConstructorPostfixPatch().Enable();
@@ -169,7 +180,7 @@ public class Plugin : BaseUnityPlugin
             tags: new ConfigurationManagerAttributes { Order = 6 }
         ));
         AdsModeRememberEnabled = Config.Bind(headerAiming, "Remember ADS Mode", true, new ConfigDescription(
-            "Toggles whether the ADS mode selected is remembered when using the ADS Mode Swap Key. Turn this off if you want ADS mode to always" +
+            "Toggles whether the ADS mode selected is remembered when using the ADS Mode Swap Key. Turn this off if you want ADS mode to always " +
             "revert to what is configured here.",
             tags: new ConfigurationManagerAttributes { Order = 5 }
         ));
@@ -225,6 +236,28 @@ public class Plugin : BaseUnityPlugin
             tags: new ConfigurationManagerAttributes { Order = 0 }
         ));
 
+        FreeAimCameraEnabled = Config.Bind(headerCamera, "Free Aim Camera", true, new ConfigDescription(
+            "In third person the camera owns the look direction and the character turns to aim where the camera aims. " +
+            "Turn this off to restore the camera rigidly following the character.",
+            tags: new ConfigurationManagerAttributes { Order = 10 }
+        ));
+        AimConvergenceEnabled = Config.Bind(headerCamera, "Aim Convergence", true, new ConfigDescription(
+            "The character aims at the point under the centre of the screen instead of parallel to the camera. " +
+            "Only applies while Free Aim Camera is on.",
+            tags: new ConfigurationManagerAttributes { Order = 9 }
+        ));
+        AimConvergenceMinDistance = Config.Bind(headerCamera, "Aim Convergence Min Distance", 1f, new ConfigDescription(
+            "The closest the aim point is allowed to be to the muzzle (in meters). Closer than this the weapon would swing hard " +
+            "to converge, so very close shots land off-centre instead (the crosshair shows where).",
+            new AcceptableValueRange<float>(0.5f, 10f),
+            tags: new ConfigurationManagerAttributes { Order = 8 }
+        ));
+        AimConvergenceSpeed = Config.Bind(headerCamera, "Aim Convergence Speed", 12f, new ConfigDescription(
+            "How quickly the aim adapts when the distance under the centre of the screen changes, e.g. sweeping from a far wall " +
+            "onto a near pillar. Higher values are snappier.",
+            new AcceptableValueRange<float>(1f, 60f),
+            tags: new ConfigurationManagerAttributes { Order = 7 }
+        ));
         CameraPositionDefault = Config.Bind(headerCamera, "Default Camera Position", CameraPositionEnum.Main, new ConfigDescription(
             "Determines the default camera position at the start of the raid, note that the game will dynamically adjust the actual position " +
             "based on multiple factors like visibility, ADS, etc.",
@@ -239,7 +272,8 @@ public class Plugin : BaseUnityPlugin
             tags: new ConfigurationManagerAttributes { Order = 4 }
         ));
         CameraGrenadeOffset = Config.Bind(headerCamera, "Grenade Cam Offset", new Vector3(0.5f, 0.2f, -0.5f), new ConfigDescription(
-            "The shoulder camera position offset relative to the first person view (in meters).",
+            "The camera position offset relative to the first person view (in meters) used while a grenade is in hands, " +
+            "in place of the main and shoulder offsets.",
             tags: new ConfigurationManagerAttributes { Order = 3 }
         ));
         CameraShoulderKey = Config.Bind(headerCamera, "Shoulder Cam Key", KeyCode.None, new ConfigDescription(

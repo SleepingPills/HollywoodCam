@@ -4,11 +4,11 @@ using EFT.Animations;
 namespace HollywoodCam;
 
 /// <summary>
-///     This class is a copy of GClass888, which uses ApplyComplexRotation instead of ApplySimpleRotation and thus adds recoil effects to the gun.
-///     The 3rd Person View GClass889 doesn't apply any recoil to the gun (or camera for that matter).
-///     The following changes are made:
-///     1. Skip AvoidObstacles to reduce the jank slightly and prevent the gun from being pushed away by walls.
-///     2. Patch PWA.LerpCamera so that it doesn't molest the position, only the rotation. This retains headbob, lean tilt and recoil.
+///     Replaces the game's ThirdPersonStrategy for the local player in 3rd person (see ProceduralWeaponAnimationSetStrategyPrefixPatch),
+///     so the weapon keeps its 1st person behaviour. Wraps FirstPersonStrategy and delegates to it, except:
+///     1. ApplyTransformations uses ApplyComplexRotation (as FirstPersonStrategy does, ThirdPersonStrategy uses ApplySimpleRotation),
+///        which is what gives the gun recoil and sway, but skips AvoidObstacles so walls do not push the gun away.
+///     2. ApplyCameraTransformations is deliberately a no-op: the mod drives the camera itself.
 /// </summary>
 public class CustomAnimStrategy : IProceduralAnimationStrategy
 {

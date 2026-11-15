@@ -45,6 +45,11 @@ public class PlayerConstructorPostfixPatch : ModulePatch
     public static void Postfix(Player __instance)
     {
         Traverse.Create(__instance).Field("_fbbikCooldown").SetValue(4f);
+
+        // Runs for every bot spawned, so only with debug logging on
+        if (!Plugin.LoggingEnabled)
+            return;
+
         var val = Traverse.Create(__instance).Field("_fbbikCooldown").GetValue<float>();
         Plugin.Log.LogInfo($"IK Cooldown: {val}");
     }

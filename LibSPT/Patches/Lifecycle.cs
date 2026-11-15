@@ -37,14 +37,14 @@ public class PlayerDisposePrefixPatch : ModulePatch
 
     [PatchPrefix]
     // ReSharper disable once InconsistentNaming
-    public static void Postfix(Player __instance)
+    public static void Prefix(Player __instance)
     {
         if (!__instance.IsYourPlayer)
             return;
 
         var tpView = __instance.gameObject.GetComponent<ThirdPersonView>();
         if (tpView == null) return;
-        
+
         Singleton<ThirdPersonView>.Release(tpView);
         Object.DestroyImmediate(tpView);
         Plugin.Log.LogInfo("Player.Dispose: ThirdPersonView destroyed successfully");
@@ -60,16 +60,16 @@ public class PlayerOnDeadPrefixPatch : ModulePatch
 
     [PatchPrefix]
     // ReSharper disable once InconsistentNaming
-    public static void Postfix(Player __instance)
+    public static void Prefix(Player __instance)
     {
         if (!__instance.IsYourPlayer)
             return;
 
         var tpView = __instance.gameObject.GetComponent<ThirdPersonView>();
         if (tpView == null) return;
-        
+
         Singleton<ThirdPersonView>.Release(tpView);
         Object.DestroyImmediate(tpView);
-        Plugin.Log.LogInfo("Player.Dispose: ThirdPersonView destroyed successfully");
+        Plugin.Log.LogInfo("Player.OnDead: ThirdPersonView destroyed successfully");
     }
 }
