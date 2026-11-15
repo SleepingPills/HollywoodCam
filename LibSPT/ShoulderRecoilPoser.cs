@@ -254,9 +254,10 @@ public class ShoulderRecoilPoser
     /// <summary>
     ///     Once per frame, from the Player.IkProcess prefix. fadeReason non-null eases the push out; scale is its target
     ///     weight otherwise (prone, crouch). rightHandWeight is the game's right arm IK weight for this frame; markers are
-    ///     the hand IK markers on the weapon (left, right), for the reach limit.
+    ///     the hand IK markers on the weapon (left, right), for the reach limit. recordDebug fills the debug UI properties,
+    ///     which cost extra bone reads; the pose is the same either way.
     /// </summary>
-    public void Apply(Player player, float rightHandWeight, Transform[] markers, string fadeReason, float scale, float strengthSetting)
+    public void Apply(Player player, float rightHandWeight, Transform[] markers, string fadeReason, float scale, float strengthSetting, bool recordDebug)
     {
         var frame = Time.frameCount;
         if (frame == _lastStepFrame)
@@ -305,7 +306,8 @@ public class ShoulderRecoilPoser
 
         _spring.Step(deltaTime, _intensity);
         Push = _spring.Push * _master;
-        RightHandWeight = rightHandWeight;
+        if (recordDebug)
+            RightHandWeight = rightHandWeight;
 
         if (!(rightHandWeight >= RightHandIkMin))
         {
@@ -381,12 +383,15 @@ public class ShoulderRecoilPoser
         twistDegrees *= restReach;
         claviclePush *= restReach;
         rockDegrees *= rockReach;
-        RestReach = restReach;
-        RockReach = rockReach;
 
         var firing = side < 0.5f ? 1 : 0;
-        RockPush = Vector3.Dot(_rockMoves[firing], back) * rockReach;
-        TwistPush = Vector3.Dot(_twistMoves[firing], back) * restReach;
+        if (recordDebug)
+        {
+            RestReach = restReach;
+            RockReach = rockReach;
+            RockPush = Vector3.Dot(_rockMoves[firing], back) * rockReach;
+            TwistPush = Vector3.Dot(_twistMoves[firing], back) * restReach;
+        }
 
         // Cache, then write: the chain bottom up, then the neck from its world rotation from before, then the clavicles
         // from where the chain moved them, then the eye back where it was
@@ -404,7 +409,7 @@ public class ShoulderRecoilPoser
         _restorePending = true;
 
         var neckRotation = _counterNeck ? _neck.rotation : Quaternion.identity;
-        var neckPosition = _neck != null ? _neck.position : Vector3.zero;
+        var neckPosition = recordDebug && _neck != null ? _neck.position : Vector3.zero;
         var eyePosition = _preserveEye ? _eye.position : Vector3.zero;
         var eyeRotation = _preserveEye ? _eye.rotation : Quaternion.identity;
 
@@ -415,7 +420,8 @@ public class ShoulderRecoilPoser
         if (_counterNeck)
             _neck.rotation = Quaternion.Slerp(_neck.rotation, neckRotation, HeadLevelShare);
 
-        HeadMove = _neck != null ? (_neck.position - neckPosition).magnitude : 0f;
+        if (recordDebug)
+            HeadMove = _neck != null ? (_neck.position - neckPosition).magnitude : 0f;
 
         var clavicleDegrees = 0f;
         var clavicleMoved = 0f;
@@ -427,8 +433,11 @@ public class ShoulderRecoilPoser
                 if (!(weight > 0f))
                     continue;
 
-                var before = _shoulders[i].position;
+                var before = recordDebug ? _shoulders[i].position : Vector3.zero;
                 var degrees = PullClavicle(i, claviclePush * weight);
+                if (!recordDebug)
+                    continue;
+
                 if (Mathf.Abs(degrees) > Mathf.Abs(clavicleDegrees))
                     clavicleDegrees = degrees;
                 if (i == firing)
@@ -438,6 +447,9 @@ public class ShoulderRecoilPoser
 
         if (_preserveEye)
             _eye.SetPositionAndRotation(eyePosition, eyeRotation);
+
+        if (!recordDebug)
+            return;
 
         RockDegrees = rockDegrees;
         TwistDegrees = twistDegrees;

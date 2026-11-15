@@ -60,6 +60,10 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<float> BodyBob;
     public static ConfigEntry<float> CameraFollowDeadzone;
     public static ConfigEntry<float> CameraFollowSmoothing;
+    public static ConfigEntry<bool> CameraTightSpace;
+    public static ConfigEntry<float> CameraTightSpaceClosest;
+    public static ConfigEntry<bool> CameraTightSpaceOverHead;
+    public static ConfigEntry<bool> CameraTightSpaceOpening;
     public static ConfigEntry<float> AimConvergenceMinDistance;
     public static ConfigEntry<float> AimConvergenceSpeed;
     public static ConfigEntry<float> FreeLookMaxAngle;
@@ -103,6 +107,13 @@ public class Plugin : BaseUnityPlugin
 
     // For log lines that would otherwise fire per player or bot
     public static bool LoggingEnabled => _loggingEnabled != null && _loggingEnabled.Value;
+
+    // The slowest Cam Movement Speed the solver applies. The setting goes down to 0, which divided into the smoothing times
+    // gave an infinite smoothing time and froze the camera offset where it was; 0.1 is a 2 s ease, as slow as is still usable.
+    public const float MinCameraMoveSpeed = 0.1f;
+
+    // Cam Movement Speed as the smoothing times are divided by it
+    public static float CameraMoveSpeedScale => Mathf.Max(MinCameraMoveSpeed, CameraMoveSpeed.Value);
 
     private void Awake()
     {
@@ -295,7 +306,7 @@ public class Plugin : BaseUnityPlugin
         ));
         CameraMoveSpeed = Config.Bind(headerCamera, "Cam Movement Speed", 1f, new ConfigDescription(
             "The speed with which the camera repositions itself when changing stances and avoiding obstacles. " +
-            "Higher values will result in a twitchier camera.",
+            "Higher values will result in a twitchier camera. Values below 0.1 behave as 0.1.",
             new AcceptableValueRange<float>(0f, 3f),
             tags: new ConfigurationManagerAttributes { Order = 1 }
         ));
@@ -319,6 +330,34 @@ public class Plugin : BaseUnityPlugin
             "behind the deadzone edge. Not used while aiming down sights.",
             new AcceptableValueRange<float>(0f, 0.5f),
             tags: new ConfigurationManagerAttributes { Order = -2 }
+        ));
+        CameraTightSpace = Config.Bind(headerCamera, "Tight Space Camera", true, new ConfigDescription(
+            "In cramped places (doorways, corridors, corners, stairwells) moves the camera in closer behind the character when " +
+            "its usual position cannot see what the character is facing, for example while walking through a doorway with the " +
+            "camera still behind the wall, and eases it back out once it can. Off keeps the camera at the configured offsets, " +
+            "only pushed out of walls.",
+            tags: new ConfigurationManagerAttributes { Order = -3 }
+        ));
+        CameraTightSpaceClosest = Config.Bind(headerCamera, "Tight Space Closest Distance", 0.3f, new ConfigDescription(
+            "How close the Tight Space Camera may bring the camera in, as a share of its configured distance behind the " +
+            "character: 0.3 means down to 30% of it. Lower values see better in tight spots but fill more of the screen with " +
+            "the character. 1 never moves it in.",
+            new AcceptableValueRange<float>(0.2f, 1f),
+            tags: new ConfigurationManagerAttributes { Order = -4 }
+        ));
+        CameraTightSpaceOverHead = Config.Bind(headerCamera, "Tight Space Over The Head", true, new ConfigDescription(
+            "With the Tight Space Camera on: when the character is pressed against a wall on the camera's side, so the camera " +
+            "ends up right behind the head and the character covers the middle of the screen, lift the camera over the " +
+            "character's head instead, and bring it back down once the wall is gone. Never while aiming down sights. Off keeps " +
+            "the camera behind the head there.",
+            tags: new ConfigurationManagerAttributes { Order = -5 }
+        ));
+        CameraTightSpaceOpening = Config.Bind(headerCamera, "Tight Space Lean Through Openings", true, new ConfigDescription(
+            "With the Tight Space Camera on: when leaning out through a doorway or round an edge from beside it, keep the " +
+            "camera on the far side, against the wall there, instead of letting it be pulled back through the opening to right " +
+            "behind the head. The character is then hidden behind the wall while the camera sees what you lean out to see. " +
+            "Off lets the camera be pulled in behind the head there.",
+            tags: new ConfigurationManagerAttributes { Order = -6 }
         ));
 
         CrosshairEnabled = Config.Bind(headerCrosshair, "Enable Crosshair", true, new ConfigDescription(

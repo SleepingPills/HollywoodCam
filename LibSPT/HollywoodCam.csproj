@@ -101,8 +101,11 @@
   <ItemGroup>
     <Compile Include="AimSolver.cs" />
     <Compile Include="AnimationStrategy.cs" />
+    <Compile Include="BoomModulator.cs" />
+    <Compile Include="Collision\CameraSweep.cs" />
     <Compile Include="Collision\CircleScan.cs" />
     <Compile Include="Collision\CollisionDebug.cs" />
+    <Compile Include="Collision\IntentProbe.cs" />
     <Compile Include="Collision\LineScan.cs" />
     <Compile Include="Collision\CollisionSolver.cs" />
     <Compile Include="Collision\Utils.cs" />
@@ -126,12 +129,15 @@
     <Compile Include="CameraRig.cs" />
     <Compile Include="GaitPoser.cs" />
     <Compile Include="GaitWeight.cs" />
+    <Compile Include="HudOverlay.cs" />
     <Compile Include="MovingDeadzone.cs" />
+    <Compile Include="OpeningCamera.cs" />
     <Compile Include="PivotFilter.cs" />
     <Compile Include="PivotTrail.cs" />
     <Compile Include="ShoulderRecoil.cs" />
     <Compile Include="ShoulderRecoilPoser.cs" />
     <Compile Include="StaticData.cs" />
+    <Compile Include="TightSpaceCandidates.cs" />
     <Compile Include="TorsoDeadzone.cs" />
     <Compile Include="Utils.cs" />
   </ItemGroup>

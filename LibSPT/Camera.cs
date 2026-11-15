@@ -29,9 +29,153 @@ public class ThirdPersonView : MonoBehaviour
 {
     public Player localPlayer;
 
+    // The debug UI setting as of this frame's UpdateCamera: everything recorded only for the debug UI checks this, so with
+    // the UI off none of it runs. The posers' hooks later in the frame read it too, at most a frame old.
+    private bool _debug;
+
+    // The crosshair and debug overlay (see HudOverlay), enabled only while one of them can draw
+    private HudOverlay _hud;
+    private bool _hudEnabled;
+
+    private bool _unknownAdsModeLogged;
+
     // Static Config
     private LayerMask _eyeCameraHitMask;
     private readonly Vector3 _eyeCameraOffset = new(0f, 0.1f, 0f);
+    // The collision cast origin is _eyeCameraOffset above the pivot, pulled down to this far short of a ceiling closer than
+    // that: a cast that starts inside a collider does not see that collider, so the solver would be blind to it
+    private const float CastOriginSkin = 0.02f;
+    // How far the last cast origin was pulled down, for the debug UI
+    private float _castOriginDrop;
+
+    // Measured cost of the camera solve (cast origin, tight space probes, collision solver), see CollisionUtils.CastCount
+    private int _solveCasts;
+    private int _originCasts;
+    private int _boomCasts;
+    private int _solverCasts;
+    // Highest per-frame count in the last completed second and in the current one
+    private int _solveCastsPeak;
+    private int _solveCastsWindowPeak;
+    private float _solveCastsWindowStart;
+    // Timed only while the debug UI is on
+    private readonly System.Diagnostics.Stopwatch _solveWatch = new();
+    private double _solveMs;
+    private double _solveMsAverage;
+    private const double SolveMsAverageWeight = 0.05;
+
+    // Tight space camera (see BoomModulator, IntentProbe): decided here, probed with IntentProbe, applied by shaping the
+    // offset the collision solver is given
+    private readonly BoomModulator _boom = new();
+    private IntentProbe _intent;
+    // What blocks sight: the camera mask without glass (TransparentCollider), which the camera must not pass through but
+    // can see through, and without corpses (Deadbody), which lie on the floor and rarely hide anything worth seeing
+    private int _visibilityMask;
+    // Each level's camera is first collision-clamped with one cast of the solver's middle phase radius, roughly where
+    // the solver would leave a camera asked to go there
+    private const float TightSpaceCandidateRadius = 0.09f;
+    // The setting's floor, also its range's
+    private const float TightSpaceMinClosest = 0.2f;
+    // Character shapes for the sight test. A sample behind the character counts as seen (the character hiding a close
+    // point is ordinary 3rd person framing, no shorter boom should try to cure it); the shapes only save the cast and
+    // label the sample for the debug UI.
+    private const float BodyHeadRadius = 0.15f;
+    private const float BodyTorsoRadius = 0.2f;
+    // The last decision is reused while the eye and pivot have moved less than this, the aim has turned less than this,
+    // nothing else it depends on changed and it is younger than the age limit. Standing still that makes a re-decision a
+    // few probes a second instead of every frame, and the age limit still catches doors and people moving.
+    private const float TightSpaceReuseMoveSqr = 0.02f * 0.02f;
+    private const float TightSpaceReuseAngle = 0.5f;
+    private const float TightSpaceReuseMaxAge = 0.25f;
+    private bool _boomDecisionValid;
+    private Vector3 _boomDecisionEye;
+    private Vector3 _boomDecisionPivot;
+    private Quaternion _boomDecisionAim;
+    private Vector3 _boomDecisionDesired;
+    private bool _boomDecisionAiming;
+    private float _boomDecisionClosest;
+    private float _boomDecisionTarget;
+    private float _boomDecisionTime;
+    // Frame the modulator last ran on; a gap (1st person, posed by game, off) means the next run snaps instead of easing
+    private int _boomLastFrame = -10;
+    // For the debug UI: each probed level's visibility and sample results, which level the decision took, the state
+    private readonly SightResult[] _levelResults = new SightResult[BoomModulator.LevelCount];
+    private readonly int[] _levelMisses = new int[BoomModulator.LevelCount];
+    private readonly TargetView[][] _levelViews = new TargetView[BoomModulator.LevelCount][];
+    private int _levelsProbed;
+    private int _boomDecidedLevel;
+    private string _boomStatus = "Not run";
+    private Vector3 _trailCancel;
+    private float _boomClosest = 1f;
+    // Stage 1's result for the level it took, for Stage 2: whether a level passed, its clamped camera and its misses
+    private readonly Vector3[] _levelCameras = new Vector3[BoomModulator.LevelCount];
+    private bool _homePassed;
+    private Vector3 _homeCamera;
+    private int _homeMisses;
+
+    // Stage 2, the over the head position (see TightSpaceCandidates): decided here from the same samples
+    private readonly TightSpaceCandidates _candidates = new();
+    // The position last asked for, re-asked while a decision is reused so its dwell keeps running
+    private int _candidateWanted = TightSpaceCandidates.Home;
+    // State the reused decision was made in: a change of either re-decides
+    private bool _boomDecisionCollapsing;
+    private int _boomDecisionActive = TightSpaceCandidates.Home;
+    private bool _candidateSwitched;
+    // The aim point is held while the camera travels between home and over the head (see HandleThirdPerson); for this
+    // long past the blend, after which the convergence hold's own settle check has normally closed it already
+    private const float CandidateHoldMargin = 0.5f;
+    // For the debug UI: the last Stage 2 probe and its casts
+    private string _candidateProbe = "-";
+    private int _candidateCasts;
+
+    // Opening camera, for a head leaned through a doorway (see OpeningCamera): while active it places the camera itself, by
+    // sweeping it from where it was, instead of the collision solver
+    private readonly OpeningCamera _opening = new();
+    // The camera's world position as placed last frame, where a sweep continues from; valid only if placed last frame
+    private Vector3 _lastCameraWorld;
+    private int _lastCameraFrame = -10;
+    // The opening camera's own position and easing velocity while active
+    private Vector3 _openingCamera;
+    private Vector3 _openingVelocity;
+    // The ordinary solve's target is reached when a sweep toward it ends this close to it
+    private const float OpeningReachTolerance = 0.05f;
+    // The camera is hidden from the head when a cast of this radius from the solver's origin stops short of this share of
+    // the way: the solver's finest phase radius, and short enough that only the jamb, not a graze, counts
+    private const float OpeningHeadCastRadius = 0.05f;
+    private const float OpeningHeadClearScore = 0.95f;
+    // The aim point is held while a bootstrap carries the camera out through the opening, for this long past its travel
+    private const float OpeningHoldMargin = 0.5f;
+    // The opening camera counts as clear when a sphere this much bigger than the swept one (half the skin) touches nothing.
+    // Unity reports colliders a sweep starts touching, which stops the move; if that test were looser than this one, a
+    // camera could rest where every move stops yet nothing is resolved, and freeze.
+    private const float OpeningClearance = OpeningCamera.CameraRadius + CameraSweep.Skin * 0.5f;
+    // A push out of an overlap longer than this is refused: a touching sphere needs its own size plus the skin at most,
+    // and a longer push means the camera was inside a solid, where the nearest way out can be the far side of a wall
+    private const float OpeningMaxPush = OpeningClearance + CameraSweep.Skin;
+    private bool _openingBootstrapped;
+    // Moves the opening camera (and the bootstrap's probes) as a sphere; the player's own colliders are not obstacles
+    private CameraSweep _sweep;
+    // Where the camera's full sphere was last found clear, for when it is found overlapping something it cannot be pushed
+    // out of; valid only while the mode holds the camera
+    private Vector3 _openingLastClear;
+    private bool _openingLastClearValid;
+    // Whether the camera was overlapping last frame, so a run of overlapping frames is one occurrence (logged once)
+    private bool _openingOverlapping;
+    // What the camera's last move stopped at: a reference written every move, described only when the mode retreats or cuts
+    private Collider _openingMoveBlocker;
+    // For the debug UI and the log, built only at the events themselves and only when either can show them: how many
+    // overlap occurrences there were, the last one's collider and how it was resolved, and what the camera had stopped at
+    // when the mode last retreated or cut
+    private int _openingOverlapEvents;
+    private string _openingOverlapInfo;
+    private string _openingBlockerInfo;
+    // For the debug UI
+    private OpeningCheck _openingCheck;
+    private string _openingStatus = "Off";
+    private int _openingCasts;
+
+    // Per collider: whether a sight line passes it (chain link, grates, glass), from its ballistic material
+    private readonly System.Collections.Generic.Dictionary<int, bool> _seeThroughCache = new();
+    private const int SeeThroughCacheLimit = 4096;
 
     // State
     private bool _thirdPersonEnabled;
@@ -201,6 +345,50 @@ public class ThirdPersonView : MonoBehaviour
 
         _gaitPoser = new GaitPoser(Plugin.GaitWeight.Value);
         _shoulderRecoilPoser = new ShoulderRecoilPoser(Plugin.ShoulderRecoil.Value);
+
+        _visibilityMask = _eyeCameraHitMask & ~LayerBit("TransparentCollider") & ~LayerBit("Deadbody");
+        _intent = new IntentProbe(_visibilityMask, _aimSolver.IsIgnored, IsSeeThrough);
+        _sweep = new CameraSweep(_aimSolver.IsIgnored);
+        for (var i = 0; i < _levelViews.Length; i++)
+            _levelViews[i] = new TargetView[IntentProbe.MaxTargets];
+
+        _hud = gameObject.AddComponent<HudOverlay>();
+        _hud.View = this;
+        _hud.enabled = _hudEnabled = false;
+    }
+
+    private static int LayerBit(string layerName)
+    {
+        var layer = LayerMask.NameToLayer(layerName);
+        return layer >= 0 ? 1 << layer : 0;
+    }
+
+    /// <summary>
+    ///     Whether a sight line passes a collider: its ballistic material is chain link, a grate or glass. Looked up the way
+    ///     the game's shots find it (on the collider or its parent), once per collider.
+    /// </summary>
+    private bool IsSeeThrough(Collider collider)
+    {
+        if (collider == null)
+            return true;
+
+        var id = collider.GetInstanceID();
+        if (_seeThroughCache.TryGetValue(id, out var seeThrough))
+            return seeThrough;
+
+        if (!collider.TryGetComponent<BallisticCollider>(out var ballistic))
+        {
+            var parent = collider.transform.parent;
+            if (parent == null || !parent.TryGetComponent(out ballistic))
+                ballistic = null;
+        }
+
+        seeThrough = ballistic != null && ballistic.TypeOfMaterial is MaterialType.Chainfence or MaterialType.Grate or MaterialType.Glass or MaterialType.GlassShattered;
+
+        if (_seeThroughCache.Count >= SeeThroughCacheLimit)
+            _seeThroughCache.Clear();
+        _seeThroughCache[id] = seeThrough;
+        return seeThrough;
     }
 
     public void OnDestroy()
@@ -214,6 +402,17 @@ public class ThirdPersonView : MonoBehaviour
         _gaitPoser?.Dispose();
 
         _rig?.Destroy();
+        _sweep?.Destroy();
+
+        // Deferred: this runs inside the DestroyImmediate of Player.Dispose and Player.OnDead. Until the end of the frame
+        // the overlay finds its view gone and draws nothing.
+        if (_hud != null)
+        {
+            _hud.enabled = false;
+            Destroy(_hud);
+        }
+
+        _hud = null;
     }
 
     /// <summary>
@@ -361,7 +560,7 @@ public class ThirdPersonView : MonoBehaviour
             ? ShoulderRecoilPoser.ProneScale
             : Mathf.Lerp(ShoulderRecoilPoser.FullCrouchScale, 1f, Mathf.Clamp01(movementContext.SmoothedPoseLevel));
 
-        _shoulderRecoilPoser.Apply(localPlayer, rightHandWeight, markers, fadeReason, scale, Plugin.ShoulderRecoil.Value);
+        _shoulderRecoilPoser.Apply(localPlayer, rightHandWeight, markers, fadeReason, scale, Plugin.ShoulderRecoil.Value, _debug);
     }
 
     /// <summary>
@@ -440,6 +639,36 @@ public class ThirdPersonView : MonoBehaviour
 
     public void UpdateCamera()
     {
+        _debug = Plugin.DebugUIEnabled.Value;
+        _positionSolver.RecordDiagnostics = _debug;
+
+        UpdateCameraAndBody();
+        UpdateHud();
+    }
+
+    /// <summary>
+    ///     Enables the overlay only on frames where DrawHud would draw something: the debug UI, or the crosshair with the
+    ///     same conditions DrawHud checks (it checks them again, and the fireport, when it draws). After the frame's update,
+    ///     so the point of view and the hands controller are this frame's.
+    /// </summary>
+    private void UpdateHud()
+    {
+        var show = localPlayer.HealthController.IsAlive && (_debug || IsCrosshairShown);
+        if (show == _hudEnabled || _hud == null)
+            return;
+
+        _hudEnabled = show;
+        _hud.enabled = show;
+    }
+
+    private bool IsCrosshairShown =>
+        Plugin.CrosshairEnabled.Value
+        && localPlayer.PointOfView != EPointOfView.FirstPerson
+        && _firearmController != null
+        && (_firearmController.IsAiming || !Plugin.CrosshairAdsOnlyEnabled.Value);
+
+    private void UpdateCameraAndBody()
+    {
         // NB: Has to be LateUpdate as doing all this in Update can cause the camera to occasionally clip into the wall when mousing violently.
         HandleInputs();
 
@@ -470,7 +699,7 @@ public class ThirdPersonView : MonoBehaviour
         _handsController = localPlayer.HandsController as Player.ItemHandsController;
         _firearmController = localPlayer.HandsController as Player.FirearmController;
 
-        // Before OnGUI's crosshair, which casts with it whether or not convergence ran
+        // Before the crosshair (DrawHud), which casts with it whether or not convergence ran
         RefreshAimIgnores();
 
         // Every frame, 1st person included, so the sample is settled by the time capture (re)starts
@@ -599,7 +828,13 @@ public class ThirdPersonView : MonoBehaviour
 
                 break;
             default:
-                Plugin.Log.LogError($"Unknown ADS mode selected: {adsModeSelected}");
+                // Reached every frame for as long as the setting holds the bad value
+                if (!_unknownAdsModeLogged)
+                {
+                    _unknownAdsModeLogged = true;
+                    Plugin.Log.LogError($"Unknown ADS mode selected: {adsModeSelected}");
+                }
+
                 break;
         }
 
@@ -809,20 +1044,73 @@ public class ThirdPersonView : MonoBehaviour
             CloseConvergenceHold();
 
         var holding = IsConvergenceHoldOpen;
-        var heldPoint = default(Vector3);
-        if (holding)
-        {
-            // Where the centre ray points now, from the current rig rotation, so mouse input in the window still aims
-            var rigRotation = _rig.Rotation;
-            heldPoint = pivot + rigRotation * _aimOffset + rigRotation * Vector3.forward * _aimSolver.SmoothedDistance;
-        }
+        var heldPoint = holding ? GetHeldAimPoint(pivot) : default;
+
+        if (_debug)
+            _solveWatch.Restart();
+        var castsAtStart = _debug ? CollisionUtils.CastCount : 0;
 
         // Cast origin is offset in world space, so it stays above the pivot regardless of pitch
-        var eyeCameraPos = _rig.Pivot.position + _eyeCameraOffset;
+        var eyeCameraPos = GetCastOrigin(_rig.Pivot.position);
+        var castsAfterOrigin = _debug ? CollisionUtils.CastCount : 0;
 
-        _currentOffset = _positionSolver.Solve(
-            _rig.Pivot, _currentOffset, desiredCameraOffset, eyeCameraPos, _eyeCameraHitMask
-        );
+        // The configured offset, shortened in tight spaces. Exactly desiredCameraOffset when the boom is at rest, when the
+        // setting is off and while the game poses the body. The solver below still has the last word on geometry.
+        var solverDesiredOffset = UpdateTightSpace(eyeTransform, pivot, desiredCameraOffset, eyeCameraPos, _aimFlag);
+        var castsAfterBoom = _debug ? CollisionUtils.CastCount : 0;
+
+        // A switch over or off the head moves the camera sideways and up or down, which unlike a boom change shifts the
+        // point under the crosshair: hold that point through the move with the convergence hold, from this frame on (the
+        // offset has not been solved yet, so the point is still the one under the centre). Never taken while aiming down
+        // sights, see UpdateTightSpace.
+        if (_candidateSwitched && _convergenceActive)
+        {
+            if (!holding)
+            {
+                holding = true;
+                heldPoint = GetHeldAimPoint(pivot);
+            }
+
+            var holdFor = TightSpaceCandidates.BlendTime / Plugin.CameraMoveSpeedScale + CandidateHoldMargin;
+            _convergenceHoldUntil = Mathf.Max(_convergenceHoldUntil, Time.time + holdFor);
+        }
+
+        // The opening camera places the camera itself while active; otherwise the solver does, and the opening camera may
+        // take over from where it left it. Reset on any gap in 3rd person (1st person, a frame not placed here).
+        var openingOn = IsOpeningCameraEnabled;
+        _openingBootstrapped = false;
+        if (_opening.Active && (!openingOn || _lastCameraFrame != Time.frameCount - 1))
+            ResetOpening(openingOn ? "reset (3rd person resumed)" : "off");
+
+        _openingCasts = 0;
+        if (_opening.Active)
+        {
+            _currentOffset = StepOpening(eyeTransform, solverDesiredOffset, eyeCameraPos);
+        }
+        else
+        {
+            _currentOffset = _positionSolver.Solve(
+                _rig.Pivot, _currentOffset, solverDesiredOffset, eyeCameraPos, _eyeCameraHitMask
+            );
+
+            if (openingOn)
+                TryEnterOpening(eyeTransform, solverDesiredOffset, eyeCameraPos);
+            else
+                _openingStatus = "Off";
+        }
+
+        // A bootstrap carries the camera out through the opening, sideways past the head: hold the aim point through it as
+        // a Stage 2 switch does (the point is taken before this frame's move reaches the aim offset)
+        if (_openingBootstrapped && _convergenceActive)
+        {
+            if (!holding)
+            {
+                holding = true;
+                heldPoint = GetHeldAimPoint(pivot);
+            }
+
+            _convergenceHoldUntil = Mathf.Max(_convergenceHoldUntil, Time.time + OpeningCamera.TravelMaxTime + OpeningHoldMargin);
+        }
 
         // Between the held point and the re-point, so the hold cancels exactly the aim camera's translation
         UpdateAimOffset();
@@ -833,9 +1121,27 @@ public class ThirdPersonView : MonoBehaviour
             _aimSolver.SnapDistance(PointRigAt(pivot, heldPoint));
             _rig.UpdatePivot(pivot);
 
-            if ((_aimOffset - desiredCameraOffset).sqrMagnitude < ConvergenceHoldSettledSqr)
+            // The offset was solved in the frame before the re-point: check it again in the frame it is placed in. Only
+            // phase 3 (unsmoothed, no state), so where nothing is in the way it returns the offset unchanged. Not for the
+            // opening camera, whose position is a world point that phase 3 (a line from the head) would pull back in: it
+            // just stays where it is.
+            if (_opening.Active)
+                _currentOffset = _rig.Pivot.InverseTransformPoint(_openingCamera);
+            else
+                _currentOffset = _positionSolver.Enforce(_rig.Pivot, _currentOffset, eyeCameraPos, _eyeCameraHitMask);
+
+            // Settled once the camera is where it is going: the shaped offset, which in a tight space is not the configured one.
+            // Not while Stage 2 is still blending, or the opening camera still travelling: the camera can sit on the
+            // shaped offset part way through either.
+            if (!_candidates.Blending && !_opening.Travelling && (_aimOffset - solverDesiredOffset).sqrMagnitude < ConvergenceHoldSettledSqr)
                 CloseConvergenceHold();
         }
+
+        _lastCameraWorld = _rig.Pivot.TransformPoint(_currentOffset);
+        _lastCameraFrame = Time.frameCount;
+
+        if (_debug)
+            RecordSolveCost(castsAtStart, castsAfterOrigin, castsAfterBoom);
 
         // Written in world space: Cam's parent is re-rotated by the game every frame, the rig is what we aim with.
         // The game copies Cam onto the real camera right after this, in the same PlayerCameraController.LateUpdate.
@@ -844,10 +1150,788 @@ public class ThirdPersonView : MonoBehaviour
     }
 
     /// <summary>
+    ///     The collision solver's cast origin: _eyeCameraOffset above the pivot, or just short of whatever is above it closer
+    ///     than that (a low ceiling, a shelf crouched under). One raycast; in the open it returns the old origin exactly.
+    /// </summary>
+    private Vector3 GetCastOrigin(Vector3 pivot)
+    {
+        var rise = _eyeCameraOffset.y;
+        _castOriginDrop = 0f;
+
+        if (CollisionUtils.Raycast(pivot, Vector3.up, out var hit, rise + CastOriginSkin, _eyeCameraHitMask))
+        {
+            var allowed = Mathf.Max(0f, hit.distance - CastOriginSkin);
+            if (allowed < rise)
+            {
+                _castOriginDrop = rise - allowed;
+                rise = allowed;
+            }
+        }
+
+        return pivot + new Vector3(_eyeCameraOffset.x, rise, _eyeCameraOffset.z);
+    }
+
+    /// <summary>
+    ///     The opening camera needs the tight space camera's view samples machinery and is off while the game poses the body.
+    /// </summary>
+    private bool IsOpeningCameraEnabled => Plugin.CameraTightSpace.Value && Plugin.CameraTightSpaceOpening.Value && !IsBodyPosedByGame;
+
+    private void ResetOpening(string reason)
+    {
+        _opening.Reset(reason);
+        _openingVelocity = Vector3.zero;
+        _openingLastClearValid = false;
+        _openingStatus = reason;
+    }
+
+    /// <summary>
+    ///     After an ordinary solve: whether the opening camera should take over this frame. Only when leaning, and the
+    ///     ordinary solve is heading for a poor view (its phase 1 target, or where its smoothing has got to, keeps the centre
+    ///     ray under OpeningCamera.EnterOrdinaryCover from the character). Then it tries the camera continuing from where it
+    ///     was last frame, and failing that a bootstrap out through the opening in the lean's direction. Taking over replaces
+    ///     this frame's offset; nothing jumps, the camera continues from where it was.
+    /// </summary>
+    private void TryEnterOpening(Transform eyeTransform, Vector3 desired, Vector3 castOrigin)
+    {
+        // This runs every 3rd person frame, and a refusal repeats for as long as the player leans: the statuses that carry
+        // numbers are only built while the debug UI can show them
+        var describe = _debug;
+
+        var lean = localPlayer.MovementContext.SmoothedTilt;
+        if (Mathf.Abs(lean) < OpeningCamera.LeanEnter)
+        {
+            _openingStatus = "off: not leaning";
+            return;
+        }
+
+        if (_opening.CoolingDown(Time.time))
+        {
+            _openingStatus = "off: cooling down after a cut";
+            return;
+        }
+
+        var body = GetBodyShape();
+        if (!body.Valid || _lastCameraFrame != Time.frameCount - 1)
+        {
+            _openingStatus = "off: no previous camera";
+            return;
+        }
+
+        var frame = _rig.Pivot;
+        var forward = frame.forward;
+        // A centred camera is the player's framing (as GetSolvedCoverDistance)
+        if (TightSpaceCandidates.RayCoverDistance(frame.TransformPoint(desired), forward, body.Head, body.TorsoTop) < TightSpaceCandidates.ReturnCoverDistance)
+        {
+            _openingStatus = "off: configured offset is centred";
+            return;
+        }
+
+        var ordinaryCover = Mathf.Min(
+            TightSpaceCandidates.RayCoverDistance(frame.TransformPoint(_positionSolver.LastPhase1Target), forward, body.Head, body.TorsoTop),
+            TightSpaceCandidates.RayCoverDistance(frame.TransformPoint(_currentOffset), forward, body.Head, body.TorsoTop));
+        if (ordinaryCover >= OpeningCamera.EnterOrdinaryCover)
+        {
+            _openingStatus = describe ? $"off: ordinary solve fine (cover {ordinaryCover:F2})" : "off: ordinary solve fine";
+            return;
+        }
+
+        var castsAtStart = describe ? CollisionUtils.CastCount : 0;
+        var eye = eyeTransform.position;
+        _intent.Sample(eye, _rig.Rotation, 0f);
+        var target = frame.TransformPoint(desired);
+        var now = Time.time;
+
+        // The camera continuing from where it was, as the opening camera would move it. The solve can leave the camera
+        // closer to a surface than the sphere's radius (its finest phase keeps 0.05 m), and a sweep starting there would
+        // not see that surface: the start is pushed clear first, and if it cannot be the camera is not kept.
+        var r = OpeningCamera.CameraRadius;
+        var keptStart = _lastCameraWorld;
+        var keptClear = _sweep.Overlap(keptStart, OpeningClearance, _eyeCameraHitMask) == 0 || _sweep.Depenetrate(ref keptStart, OpeningClearance, _eyeCameraHitMask, OpeningMaxPush);
+        var velocity = Vector3.zero;
+        var kept = keptClear ? StepOpeningCamera(keptStart, target, OpeningCamera.SmoothTime, ref velocity) : keptStart;
+        _openingCheck = MeasureOpening(kept, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true, !keptClear);
+        var keptCheck = _openingCheck;
+        if (OpeningCamera.CanEnter(keptCheck))
+        {
+            EnterOpening(now, false, default, kept, velocity);
+            _currentOffset = frame.InverseTransformPoint(kept);
+            if (describe)
+                _openingCasts = CollisionUtils.CastCount - castsAtStart;
+            return;
+        }
+
+        // Out through the opening in the lean's direction, then back toward the offset, to see where that comes to rest
+        var side = frame.right * Mathf.Sign(lean);
+        var way = _sweep.Move(castOrigin, castOrigin + side * OpeningCamera.BootstrapReach, r, _eyeCameraHitMask);
+        var rest = _sweep.Move(way, target, r, _eyeCameraHitMask);
+        var bootstrapCheck = MeasureOpening(rest, castOrigin, eye, body, forward, desired, lean, ordinaryCover, default, true, false);
+        if (OpeningCamera.CanEnter(bootstrapCheck))
+        {
+            // From the camera, pushed clear; if it cannot be, from the same point swept in from the head, which is clear
+            // (from the head always, it can stop well short of the camera: simulated jumps of half a metre)
+            var start = keptClear ? keptStart : _sweep.Move(castOrigin, _lastCameraWorld, r, _eyeCameraHitMask);
+            velocity = Vector3.zero;
+            var first = StepOpeningCamera(start, way, OpeningCamera.SmoothTime, ref velocity);
+            EnterOpening(now, true, way, first, velocity);
+            _openingCheck = bootstrapCheck;
+            _currentOffset = frame.InverseTransformPoint(first);
+            _openingBootstrapped = true;
+        }
+        else
+        {
+            _openingStatus = describe
+                ? $"refused: kept {OpeningCamera.DescribeRefusal(keptCheck)}; through the opening {OpeningCamera.DescribeRefusal(bootstrapCheck)}"
+                : "refused";
+        }
+
+        if (describe)
+            _openingCasts = CollisionUtils.CastCount - castsAtStart;
+    }
+
+    /// <summary>
+    ///     While the opening camera is active: moves it (toward the offset, its bootstrap waypoint, or back to the head when
+    ///     retreating), checks it, and returns the offset to place. On a handover the solver continues from this position;
+    ///     on a cut it starts again from its own phase 1 target.
+    /// </summary>
+    private Vector3 StepOpening(Transform eyeTransform, Vector3 desired, Vector3 castOrigin)
+    {
+        var castsAtStart = _debug ? CollisionUtils.CastCount : 0;
+        var now = Time.time;
+        var frame = _rig.Pivot;
+        var forward = frame.forward;
+        var eye = eyeTransform.position;
+        var body = GetBodyShape();
+        var lean = localPlayer.MovementContext.SmoothedTilt;
+        var retreating = _opening.State == OpeningCamera.Phase.Retreating;
+
+        // Out of anything it was found in first: a move from inside a collider would not see it
+        var clear = ResolveOpeningCamera(ref _openingCamera);
+
+        // Toward the bootstrap waypoint, the head when retreating, or the offset
+        if (clear)
+        {
+            var goal = _opening.Travelling ? _opening.Waypoint : retreating ? castOrigin : frame.TransformPoint(desired);
+            _openingCamera = StepOpeningCamera(_openingCamera, goal, retreating ? OpeningCamera.RetreatSmoothTime : OpeningCamera.SmoothTime, ref _openingVelocity);
+            _openingMoveBlocker = _sweep.LastBlocker;
+        }
+        else
+        {
+            _openingVelocity = Vector3.zero;
+        }
+
+        if (_opening.Travelling && ((_openingCamera - _opening.Waypoint).sqrMagnitude < OpeningReachTolerance * OpeningReachTolerance || _opening.TravelExpired(now)))
+            _opening.Arrived();
+
+        // Where the ordinary solve would go now, for the handover and for a cut
+        var ordinaryOffset = _positionSolver.Phase1Target(frame, desired, castOrigin, _eyeCameraHitMask);
+        var ordinary = frame.TransformPoint(ordinaryOffset);
+
+        OpeningAction action;
+        if (retreating || !body.Valid)
+        {
+            var hidden = CollisionUtils.SphereCast(castOrigin, _openingCamera, OpeningHeadCastRadius, _eyeCameraHitMask).Score < OpeningHeadClearScore;
+            action = body.Valid ? _opening.UpdateRetreat(hidden, now) : OpeningAction.Cut;
+        }
+        else
+        {
+            _intent.Sample(eye, _rig.Rotation, 0f);
+            var ordinaryCover = TightSpaceCandidates.RayCoverDistance(ordinary, forward, body.Head, body.TorsoTop);
+            _openingCheck = MeasureOpening(_openingCamera, castOrigin, eye, body, forward, desired, lean, ordinaryCover, ordinary, false, !clear);
+            action = _opening.Update(_openingCheck, now, _debug);
+        }
+
+        _openingStatus = _opening.Reason;
+        if (action is OpeningAction.Retreat or OpeningAction.Cut)
+            RecordOpeningBlocker(action);
+        if (_debug)
+            _openingCasts = CollisionUtils.CastCount - castsAtStart;
+
+        switch (action)
+        {
+            case OpeningAction.Handover:
+                _positionSolver.ResetVelocity();
+                _openingLastClearValid = false;
+                return frame.InverseTransformPoint(_openingCamera);
+            case OpeningAction.Cut:
+                if (!body.Valid)
+                    _opening.Reset("cut: no body");
+                _positionSolver.ResetVelocity();
+                _openingLastClearValid = false;
+                return ordinaryOffset;
+            default:
+                return frame.InverseTransformPoint(_openingCamera);
+        }
+    }
+
+    private void EnterOpening(float now, bool bootstrapped, Vector3 waypoint, Vector3 camera, Vector3 velocity)
+    {
+        _opening.Enter(now, bootstrapped, waypoint);
+        _openingCamera = camera;
+        _openingVelocity = velocity;
+        _openingLastClear = camera;
+        _openingLastClearValid = true;
+        _openingOverlapping = false;
+        _openingStatus = _opening.Reason;
+    }
+
+    /// <summary>
+    ///     Makes sure the opening camera's sphere is clear where it is. Found overlapping something (a rough mesh it slid onto,
+    ///     a crease, a door leaf swinging into it), it is pushed out by depenetration; failing that it goes back to where it
+    ///     was last found clear, if that is still clear. False only if neither works: the camera is stuck inside something,
+    ///     and OpeningCamera cuts once that has lasted StuckCutTime. One overlap query when clear.
+    /// </summary>
+    private bool ResolveOpeningCamera(ref Vector3 position)
+    {
+        if (_sweep.Overlap(position, OpeningClearance, _eyeCameraHitMask) == 0)
+        {
+            _openingLastClear = position;
+            _openingLastClearValid = true;
+            _openingOverlapping = false;
+            return true;
+        }
+
+        var overlapped = _sweep.LastOverlap;
+        string resolution;
+        var resolved = true;
+        var pushed = position;
+        if (_sweep.Depenetrate(ref pushed, OpeningClearance, _eyeCameraHitMask, OpeningMaxPush))
+        {
+            position = pushed;
+            _openingLastClear = position;
+            resolution = "pushed out";
+        }
+        else if (_openingLastClearValid && _sweep.Overlap(_openingLastClear, OpeningClearance, _eyeCameraHitMask) == 0)
+        {
+            position = _openingLastClear;
+            resolution = "back to last clear";
+        }
+        else
+        {
+            resolution = "could not move out";
+            resolved = false;
+        }
+
+        RecordOpeningOverlap(overlapped, resolution);
+        return resolved;
+    }
+
+    /// <summary>
+    ///     An overlap occurrence (the first frame of a run of them): counted, described for the debug UI and logged when
+    ///     either is on. Strings only at the event.
+    /// </summary>
+    private void RecordOpeningOverlap(Collider collider, string resolution)
+    {
+        if (_openingOverlapping)
+            return;
+
+        _openingOverlapping = true;
+        _openingOverlapEvents++;
+        if (!_debug && !Plugin.LoggingEnabled)
+            return;
+
+        _openingOverlapInfo = $"{DescribeCollider(collider)}, {resolution}";
+        if (Plugin.LoggingEnabled)
+            Plugin.Log.LogInfo($"Opening camera overlap #{_openingOverlapEvents}: {_openingOverlapInfo}");
+    }
+
+    /// <summary>
+    ///     What the camera's last move had stopped at when the mode retreats or cuts.
+    /// </summary>
+    private void RecordOpeningBlocker(OpeningAction action)
+    {
+        if (!_debug && !Plugin.LoggingEnabled)
+            return;
+
+        _openingBlockerInfo = $"{(action == OpeningAction.Cut ? "cut" : "retreat")}, last stopped at {DescribeCollider(_openingMoveBlocker)}";
+        if (Plugin.LoggingEnabled)
+            Plugin.Log.LogInfo($"Opening camera {_opening.Reason}: {_openingBlockerInfo}");
+    }
+
+    private static string DescribeCollider(Collider collider)
+    {
+        if (collider == null)
+            return "nothing";
+
+        var go = collider.gameObject;
+        return $"{collider.name} (root {collider.transform.root.name}, layer {LayerMask.LayerToName(go.layer)})";
+    }
+
+    /// <summary>
+    ///     One step of the opening camera from a clear position: eased toward the goal like the solver's phase 1, as a sweep,
+    ///     so it stops at and slides along what it meets. The velocity is what it actually moved, so pushing against a wall
+    ///     does not wind it up.
+    /// </summary>
+    private Vector3 StepOpeningCamera(Vector3 from, Vector3 goal, float smoothTime, ref Vector3 velocity)
+    {
+        var deltaTime = Time.deltaTime;
+        if (!(deltaTime > 0f))
+            return from;
+
+        var step = Vector3.SmoothDamp(from, goal, ref velocity, smoothTime / Plugin.CameraMoveSpeedScale, Mathf.Infinity, deltaTime);
+        var moved = _sweep.Move(from, step, OpeningCamera.CameraRadius, _eyeCameraHitMask);
+        velocity = (moved - from) / deltaTime;
+        return moved;
+    }
+
+    /// <summary>
+    ///     What OpeningCamera decides on, for a camera position. overlap is whether it is in something it could not be moved
+    ///     out of; for a candidate not yet in use, it is tested here. The ordinary target is swept to only when its cover could
+    ///     allow a handover. Casts: the view sample lines (stopping at need), maybe an overlap test and a sweep, and a head
+    ///     cast for the debug UI.
+    /// </summary>
+    private OpeningCheck MeasureOpening(Vector3 camera, Vector3 castOrigin, Vector3 eye, in BodyShape body, Vector3 forward, Vector3 desired,
+        float lean, float ordinaryCover, Vector3 ordinary, bool entering, bool overlap)
+    {
+        var check = new OpeningCheck
+        {
+            Lean = Mathf.Abs(lean),
+            OrdinaryCover = ordinaryCover,
+            CameraCover = TightSpaceCandidates.RayCoverDistance(camera, forward, body.Head, body.TorsoTop),
+            Distance = (camera - eye).magnitude,
+            MaxDistance = desired.magnitude + OpeningCamera.DistanceSlack,
+            Samples = _intent.Count,
+            Overlap = overlap || (entering && _sweep.Overlap(camera, OpeningCamera.CameraRadius, _eyeCameraHitMask) > 0),
+            // No rule reads it (a retreat makes its own head cast), only the debug UI: a cast saved otherwise
+            HiddenFromHead = _debug && CollisionUtils.SphereCast(castOrigin, camera, OpeningHeadCastRadius, _eyeCameraHitMask).Score < OpeningHeadClearScore
+        };
+
+        var need = entering ? OpeningCamera.SeenNeededToEnter(_intent.Count) : OpeningCamera.SeenToStay;
+        check.Seen = _intent.CountSeenBy(camera, OpeningCamera.CameraRadius, _eyeCameraHitMask, need);
+
+        if (!entering && ordinaryCover >= OpeningCamera.HandoverCover)
+            check.OrdinaryReachable = (_sweep.Move(camera, ordinary, OpeningCamera.CameraRadius, _eyeCameraHitMask) - ordinary).sqrMagnitude
+                                      < OpeningReachTolerance * OpeningReachTolerance;
+
+        return check;
+    }
+
+    /// <summary>
+    ///     Cast counts per section (from CollisionUtils.CastCount marks), a per-second peak, and the time. Debug UI only.
+    /// </summary>
+    private void RecordSolveCost(int castsAtStart, int castsAfterOrigin, int castsAfterBoom)
+    {
+        var castsAtEnd = CollisionUtils.CastCount;
+        _originCasts = castsAfterOrigin - castsAtStart;
+        _boomCasts = castsAfterBoom - castsAfterOrigin;
+        _solverCasts = castsAtEnd - castsAfterBoom;
+        _solveCasts = castsAtEnd - castsAtStart;
+
+        var now = Time.unscaledTime;
+        if (now - _solveCastsWindowStart >= 1f)
+        {
+            _solveCastsPeak = _solveCastsWindowPeak;
+            _solveCastsWindowPeak = 0;
+            _solveCastsWindowStart = now;
+        }
+
+        _solveCastsWindowPeak = Mathf.Max(_solveCastsWindowPeak, _solveCasts);
+
+        _solveWatch.Stop();
+        _solveMs = _solveWatch.Elapsed.TotalMilliseconds;
+        _solveMsAverage += (_solveMs - _solveMsAverage) * SolveMsAverageWeight;
+    }
+
+    /// <summary>
+    ///     The tight space camera, once per 3rd person LateUpdate between the cast origin and the collision solve: decides the
+    ///     boom (probing only when something it depends on changed), eases it, and returns the offset to give the solver.
+    ///     Returns desired unchanged and resets when the setting is off or the game poses the body.
+    /// </summary>
+    private Vector3 UpdateTightSpace(Transform eyeTransform, Vector3 pivot, Vector3 desired, Vector3 castOrigin, bool aiming)
+    {
+        var closest = Mathf.Clamp(Plugin.CameraTightSpaceClosest.Value, TightSpaceMinClosest, 1f);
+        _boomClosest = closest;
+
+        string inactive = null;
+        if (!Plugin.CameraTightSpace.Value)
+            inactive = "Off";
+        else if (closest >= 1f)
+            inactive = "Off (closest 1)";
+        else if (IsBodyPosedByGame)
+            inactive = "Posed by game";
+
+        // Stage 2 off is exactly Stage 1: reset every frame, nothing probed or computed for it
+        var overHead = Plugin.CameraTightSpaceOverHead.Value;
+        _candidateSwitched = false;
+
+        if (inactive != null)
+        {
+            _boom.Reset();
+            _candidates.Reset();
+            _boomDecisionValid = false;
+            _boomLastFrame = -10;
+            _trailCancel = Vector3.zero;
+            _levelsProbed = 0;
+            _boomStatus = inactive;
+            return desired;
+        }
+
+        var frameCount = Time.frameCount;
+        var entering = _boomLastFrame != frameCount - 1;
+        _boomLastFrame = frameCount;
+
+        // Back in 3rd person (or back on) the camera starts at home
+        if (!overHead || entering)
+            _candidates.Reset();
+
+        var frame = _rig.Pivot;
+        var eye = eyeTransform.position;
+
+        // The pivot trails the character's travel (PivotTrail) by up to a third of a metre: a short boom is measured from
+        // the eye instead, or the trail would keep the camera behind a wall plane the eye has crossed. Horizontal only,
+        // like the trail; in the pivot frame, like the offset.
+        var trail = eye - pivot;
+        trail.y = 0f;
+        _trailCancel = frame.InverseTransformVector(trail);
+
+        var now = Time.time;
+
+        // Where the solver left the camera, every frame: whether the character covers the middle of the view. No cast.
+        // Not during an orbit, which swings the view round the character on purpose.
+        if (overHead && !_rig.HasOrbit && !_opening.Active)
+            _candidates.UpdateCollapse(GetSolvedCoverDistance(desired), now);
+
+        if (_opening.Active)
+        {
+            // The opening camera is placing the camera on the far side of the wall: boom levels and the over the head
+            // position are judged along lines from the head, which the wall cuts, so both hold where they are
+            _boomDecisionValid = false;
+            _boom.Propose(_boom.Target, now);
+            _boomStatus = "Held (opening camera)";
+            _candidates.Hold();
+            _candidateProbe = "opening camera";
+        }
+        else if (_rig.HasOrbit)
+        {
+            // The view samples are along the aim, which an orbit swings off screen: no probes, ease back to the configured
+            // offset (the solver keeps it out of walls as always). Stage 2 stays where it is.
+            _boomDecisionValid = false;
+            if (entering)
+                _boom.Snap(1f, closest);
+            else
+                _boom.Propose(1f, now);
+            _boomStatus = "Orbit";
+            _candidates.Hold();
+            _candidateProbe = "orbit";
+        }
+        else if (!entering && CanReuseBoomDecision(eye, pivot, desired, aiming, closest, now, overHead))
+        {
+            _boom.Propose(_boom.Proposed, now);
+            _boomStatus = "Held";
+            if (overHead)
+                RequestCandidate(_candidateWanted, aiming, now);
+        }
+        else
+        {
+            var proposed = DecideBoom(eye, frame, desired, castOrigin, aiming, closest, out var facing);
+            if (entering)
+                _boom.Snap(proposed, closest);
+            else
+                _boom.Propose(proposed, now);
+
+            _candidateCasts = 0;
+            if (overHead)
+            {
+                if (facing || aiming)
+                {
+                    // Nothing to judge facing a surface; no lateral or vertical move while aiming down sights
+                    _candidateWanted = _candidates.Active;
+                    _candidates.Hold();
+                    _candidateProbe = facing ? "facing surface" : "aiming (frozen)";
+                }
+                else
+                {
+                    DecideCandidate(eye, frame, desired, castOrigin, closest, now);
+                }
+            }
+
+            _boomDecisionValid = true;
+            _boomDecisionEye = eye;
+            _boomDecisionPivot = pivot;
+            _boomDecisionAim = _rig.Rotation;
+            _boomDecisionDesired = desired;
+            _boomDecisionAiming = aiming;
+            _boomDecisionClosest = closest;
+            _boomDecisionTarget = _boom.Target;
+            _boomDecisionCollapsing = _candidates.Collapsing;
+            _boomDecisionActive = _candidates.Active;
+            _boomDecisionTime = now;
+            _boomStatus = facing ? "Facing surface (held)" : entering ? "Probed (entry snap)" : "Probed";
+        }
+
+        _boom.Step(aiming, closest, Plugin.CameraMoveSpeedScale, Time.deltaTime);
+
+        var home = BoomModulator.Shape(desired, _boom.Boom, _boom.Lateral, _trailCancel, BoomModulator.Shortening(_boom.Boom, closest));
+        if (!overHead)
+            return home;
+
+        _candidates.Step(aiming, Plugin.CameraMoveSpeedScale, Time.deltaTime);
+        _candidateSwitched = _candidates.ConsumeSwitch();
+
+        return _candidates.Shown == TightSpaceCandidates.Home
+            ? home
+            : _candidates.Offset(home, TightSpaceCandidates.Shape(_candidates.Shown, desired, _trailCancel, closest));
+    }
+
+    /// <summary>
+    ///     Re-asks for the last wanted position while a decision is reused, so its dwell keeps running; aiming down sights
+    ///     holds instead.
+    /// </summary>
+    private void RequestCandidate(int wanted, bool aiming, float now)
+    {
+        if (aiming)
+            _candidates.Hold();
+        else
+            _candidates.Request(wanted, now);
+    }
+
+    /// <summary>
+    ///     Whether the last decision still stands: nothing it was made from moved or changed (the target included, since a
+    ///     level's threshold depends on it) and it is recent enough to have seen doors and people move.
+    /// </summary>
+    private bool CanReuseBoomDecision(Vector3 eye, Vector3 pivot, Vector3 desired, bool aiming, float closest, float now, bool overHead)
+    {
+        // Stage 2 re-decides when the collapse state or the position in use changed, whatever else did not
+        if (overHead && (_candidates.Collapsing != _boomDecisionCollapsing || _candidates.Active != _boomDecisionActive))
+            return false;
+
+        return _boomDecisionValid
+               && now - _boomDecisionTime <= TightSpaceReuseMaxAge
+               && (eye - _boomDecisionEye).sqrMagnitude <= TightSpaceReuseMoveSqr
+               && (pivot - _boomDecisionPivot).sqrMagnitude <= TightSpaceReuseMoveSqr
+               && Quaternion.Angle(_rig.Rotation, _boomDecisionAim) <= TightSpaceReuseAngle
+               && desired == _boomDecisionDesired
+               && aiming == _boomDecisionAiming
+               && closest == _boomDecisionClosest
+               && _boom.Target == _boomDecisionTarget;
+    }
+
+    /// <summary>
+    ///     Samples the character's view from the eye, then probes the boom levels longest first and takes the first that
+    ///     misses no more than it may (BoomModulator.AllowedMissesFor); if none does, the longest within reach of the best.
+    ///     Facing a surface closer than BoomModulator.FacingSurfaceDistance nothing is probed and the target is kept.
+    ///     Casts: IntentProbe.Sample, then per level probed one collision cast plus Evaluate's.
+    /// </summary>
+    private float DecideBoom(Vector3 eye, Transform frame, Vector3 desired, Vector3 castOrigin, bool aiming, float closest, out bool facing)
+    {
+        _levelsProbed = 0;
+        facing = !_intent.Sample(eye, _rig.Rotation, BoomModulator.FacingSurfaceDistance);
+        if (facing)
+            return _boom.Target;
+
+        var body = GetBodyShape();
+
+        for (var level = 0; level < BoomModulator.LevelCount; level++)
+        {
+            var boom = BoomModulator.LevelBoom(level, closest);
+            var lateral = _boom.CandidateLateral(boom, closest, aiming);
+            var offset = BoomModulator.Shape(desired, boom, lateral, _trailCancel, BoomModulator.Shortening(boom, closest));
+            var camera = CollisionUtils.SphereCast(castOrigin, frame.TransformPoint(offset), TightSpaceCandidateRadius, _eyeCameraHitMask).TangentPoint;
+            _levelCameras[level] = camera;
+
+            var allowed = _boom.AllowedMissesFor(boom);
+            // The per-sample classification is only drawn by the debug UI
+            var result = _intent.Evaluate(camera, eye, allowed, body, _debug ? _levelViews[level] : null);
+            _levelResults[level] = result;
+            _levelMisses[level] = result.Misses;
+            _levelsProbed = level + 1;
+
+            if (result.Misses <= allowed)
+            {
+                _boomDecidedLevel = level;
+                RecordHome(true);
+                return boom;
+            }
+        }
+
+        var fallback = _boom.FallbackBoom(_levelMisses, BoomModulator.LevelCount, closest, out _boomDecidedLevel);
+        RecordHome(false);
+        return fallback;
+    }
+
+    private void RecordHome(bool passed)
+    {
+        _homePassed = passed;
+        _homeCamera = _levelCameras[_boomDecidedLevel];
+        _homeMisses = _levelMisses[_boomDecidedLevel];
+    }
+
+    /// <summary>
+    ///     Stage 2's decision, after Stage 1 probed this frame (and not facing a surface). At home: probes the alternatives
+    ///     only while collapsing, taking the first that is not covered itself and misses at least SwitchMargin fewer than
+    ///     collapsed home (whose cost includes CoverPenalty). Away from home: returns once home is clean on its own terms
+    ///     (Stage 1's level passes the lengthen rule and its predicted camera keeps the centre ray ReturnCoverDistance from
+    ///     the character), or the alternative has become clearly worse than home. Casts: one collision cast and up to a
+    ///     sample set per position looked at, nothing at home without a collapse.
+    /// </summary>
+    private void DecideCandidate(Vector3 eye, Transform frame, Vector3 desired, Vector3 castOrigin, float closest, float now)
+    {
+        // The descriptions are built per decision, which is every frame while moving: only when someone can read them
+        var describe = _debug;
+        var castsAtStart = describe ? CollisionUtils.CastCount : 0;
+        var body = GetBodyShape();
+        var forward = frame.forward;
+        var wanted = TightSpaceCandidates.Home;
+
+        if (_candidates.Active == TightSpaceCandidates.Home)
+        {
+            if (!_candidates.Collapsing || !body.Valid)
+            {
+                _candidateProbe = "no collapse";
+            }
+            else
+            {
+                var allowed = TightSpaceCandidates.Cost(_homeMisses, true) - TightSpaceCandidates.SwitchMargin;
+                if (describe)
+                    _candidateProbe = $"collapse, home {TightSpaceCandidates.Cost(_homeMisses, true)} (misses {_homeMisses} + cover {TightSpaceCandidates.CoverPenalty})";
+
+                for (var k = 0; k < TightSpaceCandidates.Alternatives.Length; k++)
+                {
+                    var camera = ClampCandidate(castOrigin, frame, TightSpaceCandidates.Shape(k, desired, _trailCancel, closest));
+                    var cover = TightSpaceCandidates.RayCoverDistance(camera, forward, body.Head, body.TorsoTop);
+                    if (cover < TightSpaceCandidates.CoverRadius)
+                    {
+                        if (describe)
+                            _candidateProbe += $" | {TightSpaceCandidates.NameOf(k)}: covered ({cover:F2}m)";
+                        continue;
+                    }
+
+                    var result = _intent.Evaluate(camera, eye, allowed, body, null, allowed);
+                    if (describe)
+                        _candidateProbe += $" | {TightSpaceCandidates.NameOf(k)}: {DescribeSight(result, allowed)}";
+                    if (result.Misses <= allowed)
+                    {
+                        wanted = k;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            var active = _candidates.Active;
+            var homeCover = _homePassed && body.Valid ? TightSpaceCandidates.RayCoverDistance(_homeCamera, forward, body.Head, body.TorsoTop) : 0f;
+            var clean = false;
+            if (_homePassed && homeCover >= TightSpaceCandidates.ReturnCoverDistance)
+            {
+                var homeResult = _intent.Evaluate(_homeCamera, eye, BoomModulator.LengthenAllowedMisses, body, null, BoomModulator.LengthenAllowedMisses);
+                clean = homeResult.Misses <= BoomModulator.LengthenAllowedMisses;
+                if (describe)
+                    _candidateProbe = $"home cover {homeCover:F2}m, {DescribeSight(homeResult, BoomModulator.LengthenAllowedMisses)}";
+            }
+            else if (describe)
+            {
+                _candidateProbe = _homePassed ? $"home cover {homeCover:F2}m" : "home level failed";
+            }
+
+            if (clean)
+            {
+                if (describe)
+                    _candidateProbe += ": clean";
+            }
+            else
+            {
+                var homeCost = TightSpaceCandidates.Cost(_homeMisses, homeCover < TightSpaceCandidates.CoverRadius);
+                var camera = ClampCandidate(castOrigin, frame, TightSpaceCandidates.Shape(active, desired, _trailCancel, closest));
+                var covered = TightSpaceCandidates.RayCoverDistance(camera, forward, body.Head, body.TorsoTop) < TightSpaceCandidates.CoverRadius;
+                // Staying as long as the alternative is not SwitchMargin worse than home
+                var limit = homeCost + TightSpaceCandidates.SwitchMargin - 1 - (covered ? TightSpaceCandidates.CoverPenalty : 0);
+                var holds = false;
+                if (limit >= 0)
+                {
+                    var result = _intent.Evaluate(camera, eye, limit, body, null, limit);
+                    holds = result.Misses <= limit;
+                    if (describe)
+                        _candidateProbe += $" | home {homeCost} | {TightSpaceCandidates.NameOf(active)}{(covered ? " covered" : "")}: {DescribeSight(result, limit)}";
+                }
+                else if (describe)
+                {
+                    _candidateProbe += $" | home {homeCost} | {TightSpaceCandidates.NameOf(active)} covered";
+                }
+
+                if (holds)
+                    wanted = active;
+            }
+        }
+
+        _candidateWanted = wanted;
+        _candidates.Request(wanted, now);
+        if (describe)
+            _candidateCasts = CollisionUtils.CastCount - castsAtStart;
+    }
+
+    private Vector3 ClampCandidate(Vector3 castOrigin, Transform frame, Vector3 offset)
+    {
+        return CollisionUtils.SphereCast(castOrigin, frame.TransformPoint(offset), TightSpaceCandidateRadius, _eyeCameraHitMask).TangentPoint;
+    }
+
+    private static string DescribeSight(in SightResult result, int allowed)
+    {
+        return $"{result.Misses}/{allowed} g{result.Geometry} c{result.Character} f{result.Far} s{result.Graze} u{result.Unchecked}";
+    }
+
+    /// <summary>
+    ///     How far the camera's centre ray, where the solver left it last frame (this frame's pivot), passes from the
+    ///     character's head-to-ribcage line. No cast. Infinite (never a collapse) when the configured offset itself keeps
+    ///     the ray closer than home would have to be to come back to: a centred camera is the player's framing, not
+    ///     something the solver did, and a camera lifted over the head from it could never return.
+    /// </summary>
+    private float GetSolvedCoverDistance(Vector3 desired)
+    {
+        var body = GetBodyShape();
+        if (!body.Valid)
+            return float.PositiveInfinity;
+
+        var frame = _rig.Pivot;
+        var forward = frame.forward;
+        if (TightSpaceCandidates.RayCoverDistance(frame.TransformPoint(desired), forward, body.Head, body.TorsoTop) < TightSpaceCandidates.ReturnCoverDistance)
+            return float.PositiveInfinity;
+
+        return TightSpaceCandidates.RayCoverDistance(frame.TransformPoint(_currentOffset), forward, body.Head, body.TorsoTop);
+    }
+
+    /// <summary>
+    ///     The character as a head sphere and a chest-to-pelvis capsule, from this frame's bones.
+    /// </summary>
+    private BodyShape GetBodyShape()
+    {
+        var bones = localPlayer.PlayerBones;
+        var head = bones != null ? bones.Head?.Original : null;
+        var ribcage = bones != null ? bones.Ribcage?.Original : null;
+        var pelvis = bones != null ? bones.Pelvis?.Original : null;
+
+        if (head == null || ribcage == null || pelvis == null)
+            return default;
+
+        return new BodyShape
+        {
+            Valid = true,
+            Head = head.position,
+            HeadRadius = BodyHeadRadius,
+            TorsoTop = ribcage.position,
+            TorsoBottom = pelvis.position,
+            TorsoRadius = BodyTorsoRadius
+        };
+    }
+
+    /// <summary>
+    ///     _currentOffset as the aim maths sees it (see UpdateAimOffsetCore). With the tight space camera on, the aim solver's
+    ///     smoothed distance is also moved by the aim camera's forward travel, so a boom change (which slides the camera along
+    ///     its own centre ray) leaves the smoothed aim point where it is instead of re-converging onto it.
+    /// </summary>
+    private void UpdateAimOffset()
+    {
+        var before = _aimOffset;
+        UpdateAimOffsetCore();
+
+        if (Plugin.CameraTightSpace.Value)
+            _aimSolver.ShiftOrigin(_aimOffset.z - before.z);
+    }
+
+    /// <summary>
     ///     Exactly _currentOffset without an orbit. Frozen while the rig has one; afterwards eased back at a bounded speed,
     ///     then exact again once it has caught up.
     /// </summary>
-    private void UpdateAimOffset()
+    private void UpdateAimOffsetCore()
     {
         if (_rig.HasOrbit)
         {
@@ -1319,6 +2403,16 @@ public class ThirdPersonView : MonoBehaviour
         return Vector3.Dot(target - (pivot + rigRotation * _aimOffset), rigRotation * Vector3.forward);
     }
 
+    /// <summary>
+    ///     Where the centre ray points now, from the current rig rotation (this frame's mouse input included, so the hold
+    ///     never fights it) and the aim camera as of the last solve.
+    /// </summary>
+    private Vector3 GetHeldAimPoint(Vector3 pivot)
+    {
+        var rigRotation = _rig.Rotation;
+        return pivot + rigRotation * _aimOffset + rigRotation * Vector3.forward * _aimSolver.SmoothedDistance;
+    }
+
     private bool IsConvergenceHoldOpen => Time.time < _convergenceHoldUntil;
 
     private void CloseConvergenceHold()
@@ -1427,15 +2521,19 @@ public class ThirdPersonView : MonoBehaviour
         CameraManager.Instance.SetFov(_gameSettings.Game.Settings.FieldOfView.Value, Plugin.AdsFovChangeTime.Value);
     }
 
-    public void OnGUI()
+    /// <summary>
+    ///     The crosshair and the debug overlay, from HudOverlay's repaint pass.
+    /// </summary>
+    public void DrawHud()
     {
-        if (!localPlayer.HealthController.IsAlive)
+        if (localPlayer == null || !localPlayer.HealthController.IsAlive)
             return;
 
         // CollisionDebug.DrawCollisionInfo(_positionSolver.Phase1.CircleScan);
 
         // @formatter:off
-        if (Plugin.DebugUIEnabled.Value)
+        // The frame's setting, as the debug records were made with
+        if (_debug)
         {
             var pwa = localPlayer.ProceduralWeaponAnimation;
             var pwaStrat = Traverse.Create(pwa).Field("_strategy").GetValue();
@@ -1497,11 +2595,24 @@ public class ThirdPersonView : MonoBehaviour
             var pivotFiltered = _pivotFilter.Offset;
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Pivot Offset Raw: {_pivotRawOffset.ToString("F3")} Filtered: {pivotFiltered.ToString("F3")} Bob Shown: {((_pivotRawOffset - pivotFiltered) * _bodyBobWeight).ToString("F3")} Weight: {_bodyBobWeight:F2} Bypassed: {_pivotFilter.Bypassed}", centered: false);
             rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Pivot Trail: {_pivotTrail.State} Lag: {_pivotTrail.Lag.magnitude * 100f:F1}cm Past Deadzone: {_pivotTrail.Excess * 100f:F1}cm ({_pivotTrail.Excess / PivotTrail.MaxTrail:P0} of cap) | Applied Deadzone: {_followDeadzone:F3}m Smoothing: {_followSmoothing:F3}s", centered: false);
+            var solver = _positionSolver;
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Solver: Decided By: {solver.DecidedBy} | P1: {solver.Phase1.Describe()}{(solver.Phase1Shifted ? " shift" : "")} ({solver.Phase1Moved * 100f:F1}cm) P2: {solver.Phase2.Describe()}{(solver.Phase2Shifted ? " shift" : "")} ({solver.Phase2Moved * 100f:F1}cm) P3: {solver.Phase3.Describe()} ({solver.Phase3Moved * 100f:F1}cm) | Off Desired: {solver.DesiredError * 100f:F1}cm | Cast Origin Drop: {_castOriginDrop * 100f:F1}cm", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Solve Cost: {_solveCasts} casts (Origin {_originCasts} Tight Space {_boomCasts} Solver {_solverCasts}) Peak/s: {Mathf.Max(_solveCastsPeak, _solveCastsWindowPeak)} | {_solveMs:F3}ms (avg {_solveMsAverage:F3}ms)", centered: false);
+            var boom = _boom;
+            var lengthen = boom.LengthenWanted >= 0f ? $" (longer wanted {boom.LengthenWanted:F2}/{BoomModulator.LengthenDwell:F2}s)"
+                : boom.ShortenWanted >= 0f ? $" (shorter wanted {boom.ShortenWanted:F2}/{BoomModulator.ShortenDwell:F2}s)" : "";
+            var cancel = _trailCancel * BoomModulator.Shortening(boom.Boom, _boomClosest);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Tight Space: {_boomStatus} | Boom: {boom.Boom:F2} Target: {boom.Target:F2} Proposed: {boom.Proposed:F2}{lengthen} | Lateral: {boom.Lateral:F2}{(_aimFlag ? " held (ADS)" : "")} | Trail Cancel: {cancel.magnitude * 100f:F1}cm", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Tight Space Probes: {DescribeBoomLevels()} | Centre Sample: {_intent.CentreDistance:F1}m Samples: {_intent.Count} ({_intent.TotalWeight} weight)", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Tight Space Over Head: {DescribeCandidates()}", centered: false);
+            rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Tight Space Opening: {DescribeOpening()}", centered: false);
             if (camTransform != null)
             {
                 rect = DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Pos: {camTransform.position} Local: {camTransform.localPosition}", centered: false);
                 DebugUI.Label(new Vector2(50, rect.y + rect.height), $"Cam Rot: {camTransform.rotation} Local: {camTransform.localRotation}", centered: false);
             }
+
+            DrawTightSpaceSamples();
         }
         // @formatter:on
 
@@ -1528,6 +2639,134 @@ public class ThirdPersonView : MonoBehaviour
             return;
 
         DrawCrosshair(screenPosition, 5, Plugin.CrosshairColor.Value, Plugin.CrosshairThickness.Value);
+    }
+
+    /// <summary>
+    ///     The opening camera for the debug UI: its state and the reason for it (why it engaged, refused or let go), the
+    ///     lean, then the last check's results: the ordinary solve's cover and whether it is reachable, the camera's cover,
+    ///     whether the head sees it, how many view samples see it, overlap, distance from the eye; and the casts it made.
+    /// </summary>
+    private string DescribeOpening()
+    {
+        if (!IsOpeningCameraEnabled)
+            return "Off";
+
+        var c = _openingCheck;
+        var lean = localPlayer.MovementContext.SmoothedTilt;
+        var state = _opening.Active
+            ? $"{_opening.State}{(_opening.Bootstrapped ? " (through the opening" + (_opening.Travelling ? ", travelling)" : ")") : " (kept)")} {Time.time - _opening.Since:F1}s"
+            : "Off";
+        var checks = c.Samples == 0
+            ? ""
+            : $" | Ordinary cover {c.OrdinaryCover:F2}{(c.OrdinaryReachable ? " reachable" : "")} | Cam cover {c.CameraCover:F2} | Head {(c.HiddenFromHead ? "hidden" : "sees it")} | Seen {c.Seen}/{c.Samples} | {(c.Overlap ? "STUCK | " : "")}Dist {c.Distance:F2}/{c.MaxDistance:F2}";
+        // The last overlap occurrence (what it was, how it was resolved) and what the camera had stopped at when the mode
+        // last retreated or cut: what a report needs to tell which cause it was
+        var overlaps = _openingOverlapEvents == 0 ? "" : $" | Overlaps {_openingOverlapEvents}, last: {_openingOverlapInfo}";
+        var blocker = _openingBlockerInfo == null ? "" : $" | Last exit: {_openingBlockerInfo}";
+        return $"{state}: {_openingStatus} | Lean {lean:F1}{checks} ({_openingCasts} casts){overlaps}{blocker}";
+    }
+
+    /// <summary>
+    ///     Stage 2 for the debug UI: the position in use and the blend toward it, the collapse trigger (the solved camera's
+    ///     centre ray distance from the character, covered now, collapsed after the dwell), any pending switch with its
+    ///     dwell, then the last probe (why, and each position looked at with misses/allowed and causes) and its casts.
+    /// </summary>
+    private string DescribeCandidates()
+    {
+        if (!Plugin.CameraTightSpaceOverHead.Value)
+            return "Off";
+
+        var c = _candidates;
+        var active = TightSpaceCandidates.NameOf(c.Active);
+        var shown = c.Shown != c.Active ? $" (easing back from {TightSpaceCandidates.NameOf(c.Shown)})" : "";
+        var cover = float.IsInfinity(c.CoverDistance) ? "-" : $"{c.CoverDistance:F2}m";
+        var trigger = c.Collapsing ? "COLLAPSING" : c.Collapsed ? "collapsed (lingering)" : c.Covered ? "covered" : "clear";
+        var pending = c.HasPending
+            ? $" | Pending: {TightSpaceCandidates.NameOf(c.Pending)} {c.PendingFor:F2}/{(c.Pending == TightSpaceCandidates.Home ? TightSpaceCandidates.ReturnDwell : TightSpaceCandidates.SwitchDwell):F2}s"
+            : "";
+        return $"{active}{shown} Blend: {c.Blend:F2} | Cover: {cover} {trigger}{pending} | Last: {_candidateProbe} ({_candidateCasts} casts)";
+    }
+
+    /// <summary>
+    ///     The last probe's levels for the debug UI, per level probed: boom, misses/allowed, then the sample counts by cause:
+    ///     g blocked by near geometry (the misses), c behind the character, f beyond the near range (or blocked only
+    ///     beyond it), s grazing the sample's own surface, u left unchecked once the level could no longer fail. c, f and s
+    ///     count as seen. * marks the level taken, - a level not probed (a longer one already passed).
+    /// </summary>
+    private string DescribeBoomLevels()
+    {
+        if (_levelsProbed == 0)
+            return "-";
+
+        var text = new System.Text.StringBuilder();
+        for (var level = 0; level < BoomModulator.LevelCount; level++)
+        {
+            if (level > 0)
+                text.Append(" | ");
+
+            var boom = BoomModulator.LevelBoom(level, _boomClosest);
+            text.Append(boom.ToString("F2"));
+            if (level == _boomDecidedLevel)
+                text.Append('*');
+
+            if (level >= _levelsProbed)
+            {
+                text.Append(" -");
+                continue;
+            }
+
+            var result = _levelResults[level];
+            text.Append(' ').Append(result.Misses).Append('/').Append(_boom.AllowedMissesFor(boom));
+            text.Append(" g").Append(result.Geometry).Append(" c").Append(result.Character).Append(" f").Append(result.Far)
+                .Append(" s").Append(result.Graze).Append(" u").Append(result.Unchecked);
+        }
+
+        return text.ToString();
+    }
+
+    /// <summary>
+    ///     The view samples on screen, coloured by how the last probe found them from the level it took: green seen, red
+    ///     blocked by near geometry (a miss), yellow behind the character, cyan beyond the near range, blue grazing its own
+    ///     surface, grey not checked. C is the centre sample, n the points along the centre ray, i the inner ring, o the
+    ///     outer rays. From that level's camera, not necessarily from where the camera is right now (the solver may have it
+    ///     elsewhere, and a held decision is up to 0.25 s old).
+    /// </summary>
+    private void DrawTightSpaceSamples()
+    {
+        if (_levelsProbed == 0 || _intent.Count == 0)
+            return;
+
+        var gameCamera = CameraManager.Instance.Camera;
+        if (gameCamera == null)
+            return;
+
+        var level = Mathf.Clamp(_boomDecidedLevel, 0, _levelsProbed - 1);
+        var views = _levelViews[level];
+        var innerStart = 1 + _intent.NearSamples;
+        var outerStart = innerStart + IntentProbe.InnerCount;
+        var colorBackup = GUI.color;
+
+        for (var i = 0; i < _intent.Count; i++)
+        {
+            var screen = gameCamera.WorldPointToVisibleScreenPoint(_intent.Targets[i]);
+            if (screen == Vector2.zero)
+                continue;
+
+            GUI.color = views[i] switch
+            {
+                TargetView.Visible => Color.green,
+                TargetView.Geometry => Color.red,
+                TargetView.Character => Color.yellow,
+                TargetView.Far => Color.cyan,
+                TargetView.Graze => Color.blue,
+                _ => Color.grey
+            };
+
+            var mark = i == 0 ? "C" : i < innerStart ? "n" : i < outerStart ? "i" : "o";
+            DebugUI.Label(screen, mark);
+        }
+
+        GUI.color = colorBackup;
     }
 
     private static void DrawCrosshair(Vector2 position, float size, Color color, float thickness)

@@ -80,6 +80,21 @@ public class AimSolver
         _hasSmoothed = false;
     }
 
+    /// <summary>
+    ///     The camera moved this far forward along its centre ray (negative: back). The smoothed distance is measured from
+    ///     the camera, so without this a boom change would move the smoothed aim point with the camera and the aim would
+    ///     re-converge onto the same target over the next frames; with it the smoothed point stays where it is in the world.
+    /// </summary>
+    public void ShiftOrigin(float forward)
+    {
+        if (!_hasSmoothed || forward == 0f || float.IsNaN(forward) || float.IsInfinity(forward) || float.IsNaN(_smoothedInverseDistance))
+            return;
+
+        var distance = Mathf.Max(1f / _smoothedInverseDistance - forward, MinRayDistance);
+        _smoothedInverseDistance = 1f / distance;
+        SmoothedDistance = distance;
+    }
+
     public void SnapDistance(float distance)
     {
         distance = Mathf.Max(distance, MinRayDistance);
@@ -209,7 +224,10 @@ public class AimSolver
         return maxDistance;
     }
 
-    private bool IsIgnored(Collider collider)
+    /// <summary>
+    ///     Whether a collider is the local player's own (as set by SetIgnored). Also used by the tight space probes.
+    /// </summary>
+    public bool IsIgnored(Collider collider)
     {
         if (collider == null)
             return true;

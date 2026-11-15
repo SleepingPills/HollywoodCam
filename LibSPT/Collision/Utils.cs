@@ -10,6 +10,13 @@ public struct SphereCastResult(float score, Vector3 tangentPoint)
 
 public static class CollisionUtils
 {
+    /// <summary>
+    ///     Every physics query the camera solve makes goes through this class and bumps this counter, so the debug UI can show
+    ///     the measured cost of a frame by taking the difference across a section. A plain increment, so it is kept with the
+    ///     debug UI off; it wraps after 2^31 queries, which a difference taken in the same frame does not notice.
+    /// </summary>
+    public static int CastCount;
+
     public static SphereCastResult SphereCast(Vector3 originPos, Vector3 targetPos, float radius, LayerMask layerMask)
     {
         var aimVector = targetPos - originPos;
@@ -18,15 +25,28 @@ public static class CollisionUtils
         if (aimVectorMagnitude == 0)
             return new SphereCastResult(0f, originPos);
 
-        if (!Physics.SphereCast(originPos, radius, aimVector.normalized, out var hitInfo, aimVectorMagnitude, layerMask))
+        CastCount++;
+
+        // Triggers ignored: a trigger volume is not something the camera can be occluded by or clip into, and the default
+        // (UseGlobal) would follow the project's queriesHitTriggers setting, which we do not control
+        if (!Physics.SphereCast(originPos, radius, aimVector.normalized, out var hitInfo, aimVectorMagnitude, layerMask, QueryTriggerInteraction.Ignore))
             return new SphereCastResult(1f, targetPos);
 
         var tangentPoint = Geometry.ClosestPointOnLine(originPos, targetPos, hitInfo.point);
 
         // Square root to concentrate most of the effect to low values and react less to differences between higher values
         var score = Mathf.Sqrt((tangentPoint - originPos).magnitude / aimVectorMagnitude);
-        
+
         return new SphereCastResult(score, tangentPoint);
     }
-    
+
+
+    /// <summary>
+    ///     A counted raycast that never hits triggers.
+    /// </summary>
+    public static bool Raycast(Vector3 origin, Vector3 direction, out RaycastHit hit, float maxDistance, int layerMask)
+    {
+        CastCount++;
+        return Physics.Raycast(origin, direction, out hit, maxDistance, layerMask, QueryTriggerInteraction.Ignore);
+    }
 }
