@@ -54,8 +54,3 @@ public class PlayerConstructorPostfixPatch : ModulePatch
         Plugin.Log.LogInfo($"IK Cooldown: {val}");
     }
 }
-
-// The old SlotViewChangedPostfixPatch (which patched EquipmentSlotClass.method_4 to force-enable renderers)
-// has been replaced by ThirdPersonView.SyncHolsteredEquipmentVisibility, called each frame from UpdateCamera.
-// A one-shot postfix on model creation races with the draw/holster model rebuild and leaves the primary
-// visible on your back while it's in your hands; see the comment on that method for the full ordering.

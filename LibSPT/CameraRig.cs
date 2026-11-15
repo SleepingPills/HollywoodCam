@@ -31,11 +31,11 @@ public class CameraRig
 
     public bool HasOrbit => OrbitYaw != 0f || OrbitPitch != 0f;
 
-    // Exactly Rotation without an orbit. The total pitch is re-clamped here because the aim pitch can move after
-    // ClampOrbit ran this frame (hold window, reconcile).
-    public Quaternion ViewRotation => HasOrbit
-        ? Quaternion.Euler(Mathf.Clamp(Pitch + OrbitPitch, Mathf.Min(-MaxViewPitch, Pitch), Mathf.Max(MaxViewPitch, Pitch)), Yaw + OrbitYaw, 0f)
-        : Rotation;
+    // The aim rotation plus the orbit. The total pitch is re-clamped here because the aim pitch can move after
+    // ClampOrbit ran this frame (hold window, reconcile); the clamp range always contains the aim pitch, so without an
+    // orbit this is Rotation.
+    public Quaternion ViewRotation =>
+        Quaternion.Euler(Mathf.Clamp(Pitch + OrbitPitch, Mathf.Min(-MaxViewPitch, Pitch), Mathf.Max(MaxViewPitch, Pitch)), Yaw + OrbitYaw, 0f);
 
     // Recreated on demand, in case something (e.g. a scene unload) destroyed it under us
     public Transform Pivot

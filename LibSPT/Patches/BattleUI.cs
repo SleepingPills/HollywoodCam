@@ -10,14 +10,13 @@ namespace HollywoodCam.Patches;
 
 public class BattleUIOnShowFireModePatch : ModulePatch
 {
-    // SPT 4.1: GClass2037 -> Player.FirearmController.Idling (per the 4.0->4.1 mapping), Player_0 -> Player.
     // Must target Idling, NOT its base FirearmOperation: Idling *overrides* these methods, and a Harmony
     // patch on a base method does not intercept calls dispatched to the override.
     //
     // Targets ShowFireMode rather than CheckFireMode: ShowFireMode is the actual choke point that tests
     // Player.FirstPersonPointOfView and then invokes Player.OnShowFireMode (the UI callback), and it is
     // reached from BOTH CheckFireMode (inspect the selector) and ChangeFireMode (switch it). Wrapping only
-    // CheckFireMode left the switch path unspoofed, so the text stayed hidden in 3rd person.
+    // CheckFireMode would leave the switch path unspoofed, so the text would stay hidden in 3rd person.
     protected override MethodBase GetTargetMethod()
     {
         return typeof(Player.FirearmController.Idling).GetMethod(nameof(Player.FirearmController.Idling.ShowFireMode));

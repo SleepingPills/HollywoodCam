@@ -39,11 +39,6 @@ public class CustomAnimStrategy : IProceduralAnimationStrategy
         // ThirdPersonView.UpdateCamera. Delegating to FirstPersonStrategy here would run
         // CalculateCameraPosition + LerpCamera and move the real camera, fighting the mod's own camera --
         // which shows up as violent shaking during reloads, when tactical-reload transforms are largest.
-        //
-        // NB: in 1.2.0 this method never actually ran. The strategy hijack tested `strategy is GClass908`,
-        // which the 4.0->4.1 mapping shows was BetterValProcessor (an ordinary object, not a strategy), so
-        // the check could never be true. Correcting it to ThirdPersonStrategy activated this path for the
-        // first time and exposed the conflict.
     }
 
     public void LateTransformations(ProceduralWeaponAnimation pwa, float dt)

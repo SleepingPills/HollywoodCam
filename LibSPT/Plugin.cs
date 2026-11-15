@@ -58,11 +58,8 @@ public class Plugin : BaseUnityPlugin
     public static ConfigEntry<KeyCode> CameraShoulderKey;
     public static ConfigEntry<float> CameraMoveSpeed;
     public static ConfigEntry<float> BodyBob;
-    public static ConfigEntry<bool> FreeAimCameraEnabled;
-    public static ConfigEntry<bool> AimConvergenceEnabled;
     public static ConfigEntry<float> AimConvergenceMinDistance;
     public static ConfigEntry<float> AimConvergenceSpeed;
-    public static ConfigEntry<bool> FreeLookOrbitEnabled;
     public static ConfigEntry<float> FreeLookMaxAngle;
 
     public static ConfigEntry<AdsModeEnum> AdsModeOptic;
@@ -135,7 +132,6 @@ public class Plugin : BaseUnityPlugin
         // Player
         new PlayerConstructorPostfixPatch().Enable();
         new PlayerShotReactionsPostfixPatch().Enable();
-        // SlotViewChangedPostfixPatch removed: replaced by per-frame SyncHolsteredEquipmentVisibility (see Camera.cs)
 
         // Lean
         new PlayerOnLeanPostfixPatch().Enable();
@@ -246,35 +242,23 @@ public class Plugin : BaseUnityPlugin
             tags: new ConfigurationManagerAttributes { Order = 0 }
         ));
 
-        FreeAimCameraEnabled = Config.Bind(headerCamera, "Free Aim Camera", true, new ConfigDescription(
-            "In third person the camera owns the look direction and the character turns to aim where the camera aims. " +
-            "Turn this off to restore the camera rigidly following the character.",
-            tags: new ConfigurationManagerAttributes { Order = 12 }
-        ));
-        AimConvergenceEnabled = Config.Bind(headerCamera, "Aim Convergence", true, new ConfigDescription(
-            "The character aims at the point under the centre of the screen instead of parallel to the camera. " +
-            "Only applies while Free Aim Camera is on.",
-            tags: new ConfigurationManagerAttributes { Order = 11 }
-        ));
         AimConvergenceMinDistance = Config.Bind(headerCamera, "Aim Convergence Min Distance", 1f, new ConfigDescription(
-            "The closest the aim point is allowed to be to the muzzle (in meters). Closer than this the weapon would swing hard " +
-            "to converge, so very close shots land off-centre instead (the crosshair shows where).",
+            "In third person the character aims at the point under the centre of the screen. This is the closest that point is " +
+            "allowed to be to the muzzle (in meters). Closer than this the weapon would swing hard to converge, so very close " +
+            "shots land off-centre instead (the crosshair shows where).",
             new AcceptableValueRange<float>(0.5f, 10f),
-            tags: new ConfigurationManagerAttributes { Order = 10 }
+            tags: new ConfigurationManagerAttributes { Order = 9 }
         ));
         AimConvergenceSpeed = Config.Bind(headerCamera, "Aim Convergence Speed", 12f, new ConfigDescription(
             "How quickly the aim adapts when the distance under the centre of the screen changes, e.g. sweeping from a far wall " +
             "onto a near pillar. Higher values are snappier.",
             new AcceptableValueRange<float>(1f, 60f),
-            tags: new ConfigurationManagerAttributes { Order = 9 }
-        ));
-        FreeLookOrbitEnabled = Config.Bind(headerCamera, "Free Look Orbit", true, new ConfigDescription(
-            "Holding the game's free look key in third person orbits the camera around the character instead of only turning " +
-            "the head. The character keeps aiming where it was, and the camera swings back when the key is released.",
             tags: new ConfigurationManagerAttributes { Order = 8 }
         ));
         FreeLookMaxAngle = Config.Bind(headerCamera, "Free Look Max Angle", 150f, new ConfigDescription(
-            "How far (in degrees) the free look orbit can swing the camera to either side of the aim direction.",
+            "Holding the game's free look key in third person orbits the camera around the character, which keeps aiming where " +
+            "it was; the camera swings back when the key is released. This is how far (in degrees) the orbit can swing the " +
+            "camera to either side of the aim direction.",
             new AcceptableValueRange<float>(40f, 180f),
             tags: new ConfigurationManagerAttributes { Order = 7 }
         ));
@@ -308,7 +292,7 @@ public class Plugin : BaseUnityPlugin
         ));
         BodyBob = Config.Bind(headerCamera, "Body Bob", 0.8f, new ConfigDescription(
             "How much the character's head and shoulders are allowed to move on screen when walking and sprinting. " +
-            "0 locks the camera to the head so the head stays perfectly level (the old behaviour), 1 keeps the camera steady " +
+            "0 locks the camera to the head so the head stays perfectly level, 1 keeps the camera steady " +
             "so the full motion of the animation shows.",
             new AcceptableValueRange<float>(0f, 1f),
             tags: new ConfigurationManagerAttributes { Order = 0 }
